@@ -270,67 +270,6 @@ std::uint64_t pci_dma_buffer_get_user_addr(DMAbuffer &dma_buffer) {
     return reinterpret_cast<std::uint64_t>(dma_buffer.pBuf);
 }
 
-bool is_char_dev(const dirent *ent, const char *parent_dir) {
-    if (ent->d_type == DT_UNKNOWN || ent->d_type == DT_LNK) {
-        char name[2 * NAME_MAX + 2];
-        strcpy(name, parent_dir);
-        strcat(name, "/");
-        strcat(name, ent->d_name);
-
-        struct stat stat_result;
-        if (stat(name, &stat_result) == -1) {
-            return false;
-        }
-
-        return ((stat_result.st_mode & S_IFMT) == S_IFCHR);
-    } else {
-        return (ent->d_type == DT_CHR);
-    }
-}
-
-std::vector<chip_id_t> ttkmd_scan() {
-
-    static const char dev_dir[] = "/dev/tenstorrent";
-
-    std::vector<chip_id_t> found_devices;
-
-    DIR *d = opendir(dev_dir);
-    if (d != nullptr) {
-        while (true) {
-            const dirent *ent = readdir(d);
-            if (ent == nullptr) {
-                break;
-            }
-
-            // strtoul allows initial whitespace, +, -
-            if (!std::isdigit(ent->d_name[0])) {
-                continue;
-            }
-
-            if (!is_char_dev(ent, dev_dir)) {
-                continue;
-            }
-
-            char *endptr = nullptr;
-            errno = 0;
-            unsigned long index = std::strtoul(ent->d_name, &endptr, 10);
-            if (index == std::numeric_limits<unsigned int>::max() && errno == ERANGE) {
-                continue;
-            }
-            if (*endptr != '\0') {
-                continue;
-            }
-
-            found_devices.push_back( (chip_id_t) index);
-        }
-        closedir(d);
-    }
-
-    std::sort(found_devices.begin(), found_devices.end());
-
-    return found_devices;
-}
-
 int get_link_width(TTDevice *dev) {
 
     static const char pattern[] = "/sys/bus/pci/devices/%04x:%02x:%02x.%u/current_link_width";

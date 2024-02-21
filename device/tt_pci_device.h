@@ -55,3 +55,4 @@ struct TTDevice
 };
 
 PCIdevice ttkmd_open(DWORD device_id);
+std::vector<int> ttkmd_scan();

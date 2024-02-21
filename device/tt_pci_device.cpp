@@ -1,5 +1,6 @@
 #include "tt_pci_device.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/pci.h>
 #include <sys/ioctl.h>
@@ -8,6 +9,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -264,4 +266,66 @@ PCIdevice ttkmd_open(DWORD device_id)
     device.revision_id = get_revision_id(ttdev);
 
     return device;
+}
+
+static bool is_char_dev(const dirent *ent, const char *parent_dir) {
+    if (ent->d_type == DT_UNKNOWN || ent->d_type == DT_LNK) {
+        char name[2 * NAME_MAX + 2];
+        strcpy(name, parent_dir);
+        strcat(name, "/");
+        strcat(name, ent->d_name);
+
+        struct stat stat_result;
+        if (stat(name, &stat_result) == -1) {
+            return false;
+        }
+
+        return ((stat_result.st_mode & S_IFMT) == S_IFCHR);
+    } else {
+        return (ent->d_type == DT_CHR);
+    }
+}
+
+
+std::vector<int> ttkmd_scan() {
+
+    static const char dev_dir[] = "/dev/tenstorrent";
+
+    std::vector<int> found_devices;
+
+    DIR *d = opendir(dev_dir);
+    if (d != nullptr) {
+        while (true) {
+            const dirent *ent = readdir(d);
+            if (ent == nullptr) {
+                break;
+            }
+
+            // strtoul allows initial whitespace, +, -
+            if (!std::isdigit(ent->d_name[0])) {
+                continue;
+            }
+
+            if (!is_char_dev(ent, dev_dir)) {
+                continue;
+            }
+
+            char *endptr = nullptr;
+            errno = 0;
+            auto index = std::strtoul(ent->d_name, &endptr, 10);
+            if (index == std::numeric_limits<unsigned int>::max() && errno == ERANGE) {
+                continue;
+            }
+            if (*endptr != '\0') {
+                continue;
+            }
+
+            found_devices.push_back((int)index);
+        }
+        closedir(d);
+    }
+
+    std::sort(found_devices.begin(), found_devices.end());
+
+    return found_devices;
 }
