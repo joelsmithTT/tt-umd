@@ -37,8 +37,8 @@ struct TTDevice
 
     unsigned int next_dma_buf = 0;
 
-	DMAbuffer dma_completion_flag_buffer;  // When DMA completes, it writes to this buffer
-	DMAbuffer dma_transfer_buffer;         // Buffer for large DMA transfers
+    DMAbuffer dma_completion_flag_buffer;  // When DMA completes, it writes to this buffer
+    DMAbuffer dma_transfer_buffer;         // Buffer for large DMA transfers
 
     std::uint32_t max_dma_buf_size_log2;
 
