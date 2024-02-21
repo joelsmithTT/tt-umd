@@ -123,7 +123,6 @@ const char* hugepage_dir_env = std::getenv("TT_BACKEND_HUGEPAGE_DIR");
 std::string hugepage_dir = hugepage_dir_env ? hugepage_dir_env : "/dev/hugepages-1G";
 
 // Foward declarations
-PCIdevice ttkmd_open(DWORD device_id, bool sharable /* = false */);
 int ttkmd_close(struct PCIdevice &device);
 
 uint32_t pcie_dma_transfer_turbo (TTDevice *dev, uint32_t chip_addr, uint32_t host_phys_addr, uint32_t size_bytes, bool write);
@@ -255,7 +254,7 @@ tt::ARCH detect_arch(uint16_t device_id) {
         WARN("---- tt_SiliconDevice::detect_arch did not find silcon device_id: %d\n", device_id);
         return arch_name;
     }
-    struct PCIdevice pci_device = ttkmd_open((DWORD)device_id, false);
+    struct PCIdevice pci_device = ttkmd_open((DWORD)device_id);
 
     arch_name = detect_arch(&pci_device);
 
@@ -276,9 +275,6 @@ std::uint64_t pci_dma_buffer_get_user_addr(DMAbuffer &dma_buffer) {
     log_assert (dma_buffer.pBuf, "DMA Buffer not initialized");
     return reinterpret_cast<std::uint64_t>(dma_buffer.pBuf);
 }
-
-DWORD ttkmd_init() { return 0; }    // 0 on success
-DWORD ttkmd_uninit() { return 0; }  // 0 on success
 
 bool is_char_dev(const dirent *ent, const char *parent_dir) {
     if (ent->d_type == DT_UNKNOWN || ent->d_type == DT_LNK) {
@@ -358,22 +354,6 @@ int get_config_space_fd(TTDevice *dev) {
     return dev->sysfs_config_fd;
 }
 
-int get_revision_id(TTDevice *dev) {
-
-    static const char pattern[] = "/sys/bus/pci/devices/%04x:%02x:%02x.%u/revision";
-    char buf[sizeof(pattern)];
-    std::snprintf(buf, sizeof(buf), pattern,
-    (unsigned int)dev->pci_domain, (unsigned int)dev->pci_bus, (unsigned int)dev->pci_device, (unsigned int)dev->pci_function);
-
-    std::ifstream revision_file(buf);
-    std::string revision_string;
-    if (std::getline(revision_file, revision_string)) {
-        return std::stoi(revision_string, nullptr, 0);
-    } else {
-        throw std::runtime_error("Revision ID read failed for device");
-    }
-}
-
 int get_link_width(TTDevice *dev) {
 
     static const char pattern[] = "/sys/bus/pci/devices/%04x:%02x:%02x.%u/current_link_width";
@@ -405,18 +385,6 @@ int get_link_speed(TTDevice *dev) {
     } else {
         throw std::runtime_error("Link speed read failed for device");
     }
-}
-
-std::uint64_t read_bar0_base(TTDevice *dev) {
-    const std::uint64_t bar_address_mask = ~(std::uint64_t)0xF;
-    unsigned int bar0_config_offset = 0x10;
-
-    std::uint64_t bar01;
-    if (pread(get_config_space_fd(dev), &bar01, sizeof(bar01), bar0_config_offset) != sizeof(bar01)) {
-        return 0;
-    }
-
-    return bar01 & bar_address_mask;
 }
 
 DMAbuffer allocate_dma_buffer(TTDevice *ttdev, unsigned int buffer_index, std::size_t size) {
@@ -454,30 +422,6 @@ DMAbuffer allocate_dma_buffer(TTDevice *ttdev, unsigned int buffer_index, std::s
     return dmabuf;
 }
 
-PCIdevice ttkmd_open(DWORD device_id, bool sharable /* = false */)
-{
-    (void)sharable; // presently ignored
-
-    auto ttdev = std::make_unique<TTDevice>(TTDevice::open(device_id));
-
-    PCIdevice device;
-    device.id = device_id;
-    device.hdev = ttdev.get();
-    device.vendor_id = ttdev->device_info.vendor_id;
-    device.device_id = ttdev->device_info.device_id;
-    device.subsystem_vendor_id = ttdev->device_info.subsystem_vendor_id;
-    device.subsystem_id = ttdev->device_info.subsystem_id;
-    device.dwBus = ttdev->pci_bus;
-    device.dwSlot = ttdev->pci_device;
-    device.dwFunction = ttdev->pci_function;
-    device.BAR_addr = read_bar0_base(ttdev.get());
-    device.BAR_size_bytes = ttdev->bar0_uc_size;
-    device.revision_id = get_revision_id(ttdev.get());
-    ttdev.release();
-
-    return device;
-}
-
 int ttkmd_close(struct PCIdevice &device) {
     delete static_cast<TTDevice*>(device.hdev);
 
@@ -507,40 +451,6 @@ bool is_hardware_hung(const TTDevice *dev) {
     return (scratch_data == 0xffffffffu);
 }
 
-bool reset_by_sysfs(TTDevice *dev) {
-
-    const char *virtual_env = getenv("VIRTUAL_ENV");
-    if (virtual_env == nullptr)
-        return false;
-
-    std::string reset_helper_path = virtual_env;
-    reset_helper_path += "/bin/reset-helper";
-
-    std::string busid = std::to_string(dev->pci_bus);
-
-    dev->suspend_before_device_reset();
-
-    char *argv[3];
-    argv[0] = const_cast<char*>(reset_helper_path.c_str());
-    argv[1] = const_cast<char*>(busid.c_str());
-    argv[2] = nullptr;
-
-    pid_t reset_helper_pid;
-    if (posix_spawn(&reset_helper_pid, reset_helper_path.c_str(), nullptr, nullptr, argv, environ) != 0)
-        return false;
-
-    siginfo_t reset_helper_status;
-    if (waitid(P_PID, reset_helper_pid, &reset_helper_status, WEXITED) != 0)
-        return false;
-
-    if (reset_helper_status.si_status != 0)
-        return false;
-
-    dev->resume_after_device_reset();
-
-    return true;
-}
-
 bool reset_by_ioctl(TTDevice *dev) {
     struct tenstorrent_reset_device reset_device;
     memset(&reset_device, 0, sizeof(reset_device));
@@ -556,7 +466,7 @@ bool reset_by_ioctl(TTDevice *dev) {
 }
 
 bool auto_reset_board(TTDevice *dev) {
-    return ((reset_by_ioctl(dev) || reset_by_sysfs(dev)) && !is_hardware_hung(dev));
+    return (reset_by_ioctl(dev) && !is_hardware_hung(dev));
 }
 
 void detect_ffffffff_read(TTDevice *dev, std::uint32_t data_read = 0xffffffffu) {
@@ -1087,7 +997,6 @@ dynamic_tlb set_dynamic_tlb(PCIdevice* dev, unsigned int tlb_index, tt_xy_pair s
     }.apply_offset(tlb_offset);
 
     LOG1 ("set_dynamic_tlb() with tlb_index: %d tlb_index_offset: %d dynamic_tlb_size: %dMB tlb_base: 0x%x tlb_cfg_reg: 0x%x\n", tlb_index, tlb_index_offset, dynamic_tlb_size/(1024*1024), tlb_base, tlb_cfg_reg);
-    //write_regs(dev -> hdev, tlb_cfg_reg, 2, &tlb_data);
     write_tlb_reg(dev->hdev, tlb_cfg_reg, *tlb_data);
 
     return { tlb_base + local_offset, dynamic_tlb_size - local_offset };
@@ -1193,7 +1102,9 @@ void tt_SiliconDevice::create_device(const std::unordered_set<chip_id_t> &target
         int pci_interface_id = logical_to_physical_device_id_map.at(logical_device_id);
 
         log_debug(LogSiliconDriver, "Opening TT_PCI_INTERFACE_ID {} for netlist target_device_id: {}", pci_interface_id, logical_device_id);
-        *pci_device = ttkmd_open ((DWORD) pci_interface_id, false);
+
+        // THIS IS THE DROID YOU ARE LOOKING FOR 
+        *pci_device = ttkmd_open ((DWORD) pci_interface_id);
         pci_device->logical_id = logical_device_id;
 
         m_num_host_mem_channels = get_available_num_host_mem_channels(num_host_mem_ch_per_mmio_device, pci_device->device_id, pci_device->revision_id);
@@ -2699,7 +2610,7 @@ std::unordered_map<chip_id_t, chip_id_t> tt_SiliconDevice::get_logical_to_physic
 
 }
 
-
+// TODO(jms): is this used?
 // Get PCI bus_id info for looking up TT devices in hwloc to find associated CPU package.
 std::map<chip_id_t, std::string> tt_SiliconDevice::get_physical_device_id_to_bus_id_map(std::vector<chip_id_t> physical_device_ids){
 
@@ -2707,12 +2618,12 @@ std::map<chip_id_t, std::string> tt_SiliconDevice::get_physical_device_id_to_bus
 
     for (auto &pci_interface_id : physical_device_ids){
 
-        auto ttdev = std::make_unique<TTDevice>(TTDevice::open(pci_interface_id));
+        TTDevice ttdev(pci_interface_id);
 
         std::ostringstream pci_bsf;
-        pci_bsf << std::hex << std::setw(2) << std::setfill('0') << (int) ttdev->pci_bus << ":";
-        pci_bsf << std::hex << std::setw(2) << std::setfill('0') << (int) ttdev->pci_device << ".";
-        pci_bsf << std::hex << (int) ttdev->pci_function;
+        pci_bsf << std::hex << std::setw(2) << std::setfill('0') << (int) ttdev.pci_bus << ":";
+        pci_bsf << std::hex << std::setw(2) << std::setfill('0') << (int) ttdev.pci_device << ".";
+        pci_bsf << std::hex << (int) ttdev.pci_function;
 
         std::string pci_bsf_str = pci_bsf.str();
         LOG2("get_physical_device_id_to_bus_id_map() -- pci_interface_id: %d BSF: %s\n", pci_interface_id, pci_bsf_str.c_str());
@@ -2721,7 +2632,6 @@ std::map<chip_id_t, std::string> tt_SiliconDevice::get_physical_device_id_to_bus
     }
 
     return physical_device_id_to_bus_id_map;
-
 }
 
 uint64_t tt_SiliconDevice::get_sys_addr(uint32_t chip_x, uint32_t chip_y, uint32_t noc_x, uint32_t noc_y, uint64_t offset) {

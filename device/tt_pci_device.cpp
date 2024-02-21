@@ -8,8 +8,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <stdexcept>
 #include <cstring>
+#include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "ioctl.h"
@@ -18,18 +20,6 @@
 static uint32_t GS_BAR0_WC_MAPPING_SIZE = (156<<20) + (10<<21) + (18<<24);
 static const uint16_t WORMHOLE_DEVICE_ID = 0x401e;
 
-// TODO(jms): are we scared of just using the constructor??
-TTDevice TTDevice::open(unsigned int device_id) {
-    TTDevice ttdev;
-    static int unique_id = 0;
-    ttdev.index = device_id;
-    ttdev.do_open();
-
-    return ttdev;
-}
-
-// TODO(jms): This is a strange way to spell "open".
-// TODO(jms): There's another one of these in tt_silicon_driver.cpp
 static int find_device(const uint16_t device_id) {
     const char device_name_pattern[] = "/dev/tenstorrent/%u";
     // returns device id if found, otherwise -1
@@ -39,21 +29,10 @@ static int find_device(const uint16_t device_id) {
     return device_fd;
 }
 
-// TODO(jms): Doesn't seem to be necessary anymore?
-// Open a unique device_id per host memory channel (workaround for ttkmd < 1.21 support for more than 1 pin per fd)
-void TTDevice::open_hugepage_per_host_mem_ch(uint32_t num_host_mem_channels) {
-    for (int ch = 0; ch < num_host_mem_channels; ch++) {
-        int device_fd_for_host_mem = find_device(index);
-        if (device_fd_for_host_mem == -1) {
-            throw std::runtime_error(
-                std::string("Failed opening a host memory device handle for device ") + std::to_string(index));
-        }
-        device_fd_per_host_ch.push_back(device_fd_for_host_mem);
-    }
-}
-
-inline void TTDevice::do_open() {
-    device_fd = find_device(index);
+TTDevice::TTDevice(uint32_t device_id)
+    : index(device_id)
+    , device_fd(find_device(index))
+{
     if (device_fd == -1) {
         throw std::runtime_error(std::string("Failed opening a handle for device ") + std::to_string(index));
     }
@@ -180,7 +159,7 @@ inline void TTDevice::do_open() {
     pci_function = PCI_FUNC(device_info.out.bus_dev_fn);
 }
 
-void TTDevice::reset() {
+TTDevice::~TTDevice() {
     if (device_fd != -1) {
         close(device_fd);
     }
@@ -204,15 +183,85 @@ void TTDevice::reset() {
     if (sysfs_config_fd != -1) {
         close(sysfs_config_fd);
     }
-
-    drop();
 }
 
-void TTDevice::drop() {
-    device_fd = -1;
-    bar0_uc = nullptr;
-    bar0_wc = nullptr;
-    system_reg_mapping = nullptr;
-    dma_buffer_mappings.clear();
-    sysfs_config_fd = -1;
+// TODO(jms): Doesn't seem to be necessary anymore?
+// Open a unique device_id per host memory channel (workaround for ttkmd < 1.21 support for more than 1 pin per fd)
+void TTDevice::open_hugepage_per_host_mem_ch(uint32_t num_host_mem_channels) {
+    for (int ch = 0; ch < num_host_mem_channels; ch++) {
+        int device_fd_for_host_mem = find_device(index);
+        if (device_fd_for_host_mem == -1) {
+            throw std::runtime_error(
+                std::string("Failed opening a host memory device handle for device ") + std::to_string(index));
+        }
+        device_fd_per_host_ch.push_back(device_fd_for_host_mem);
+    }
+}
+
+
+static int get_revision_id(TTDevice *dev) {
+
+    static const char pattern[] = "/sys/bus/pci/devices/%04x:%02x:%02x.%u/revision";
+    char buf[sizeof(pattern)];
+    std::snprintf(buf, sizeof(buf), pattern,
+    (unsigned int)dev->pci_domain, (unsigned int)dev->pci_bus, (unsigned int)dev->pci_device, (unsigned int)dev->pci_function);
+
+    std::ifstream revision_file(buf);
+    std::string revision_string;
+    if (std::getline(revision_file, revision_string)) {
+        return std::stoi(revision_string, nullptr, 0);
+    } else {
+        throw std::runtime_error("Revision ID read failed for device");
+    }
+}
+
+static int get_config_space_fd(TTDevice *dev) {
+    if (dev->sysfs_config_fd == -1) {
+        static const char pattern[] = "/sys/bus/pci/devices/0000:%02x:%02x.%u/config";
+        char buf[sizeof(pattern)];
+        std::snprintf(buf, sizeof(buf), pattern,
+                      (unsigned int)dev->pci_bus, (unsigned int)dev->pci_device, (unsigned int)dev->pci_function);
+        dev->sysfs_config_fd = open(buf, O_RDWR);
+
+        if (dev->sysfs_config_fd == -1) {
+            dev->sysfs_config_fd = open(buf, O_RDONLY);
+        }
+    }
+
+    return dev->sysfs_config_fd;
+}
+
+static uint64_t read_bar0_base(TTDevice *dev) {
+    const std::uint64_t bar_address_mask = ~(std::uint64_t)0xF;
+    unsigned int bar0_config_offset = 0x10;
+
+    std::uint64_t bar01;
+    if (pread(get_config_space_fd(dev), &bar01, sizeof(bar01), bar0_config_offset) != sizeof(bar01)) {
+        return 0;
+    }
+
+    return bar01 & bar_address_mask;
+}
+
+// TODO(jms): why can't PCIDevice and TTDevice be the same thing?
+// Do we not have enough classes with the word device in the name?
+PCIdevice ttkmd_open(DWORD device_id)
+{
+    TTDevice *ttdev = new TTDevice(device_id);
+
+    PCIdevice device;
+    device.id = device_id;
+    device.hdev = ttdev;
+    device.vendor_id = ttdev->device_info.vendor_id;
+    device.device_id = ttdev->device_info.device_id;
+    device.subsystem_vendor_id = ttdev->device_info.subsystem_vendor_id;
+    device.subsystem_id = ttdev->device_info.subsystem_id;
+    device.dwBus = ttdev->pci_bus;
+    device.dwSlot = ttdev->pci_device;
+    device.dwFunction = ttdev->pci_function;
+    device.BAR_addr = read_bar0_base(ttdev);
+    device.BAR_size_bytes = ttdev->bar0_uc_size;
+    device.revision_id = get_revision_id(ttdev);
+
+    return device;
 }

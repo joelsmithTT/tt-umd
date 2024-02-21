@@ -7,7 +7,7 @@
 #include "ioctl.h"
 
 
-struct TTDeviceBase
+struct TTDevice
 {
     unsigned int index;
 
@@ -45,39 +45,13 @@ struct TTDeviceBase
     tenstorrent_get_device_info_out device_info;
 
     std::vector<DMAbuffer> dma_buffer_mappings;
-};
 
-struct TTDevice : TTDeviceBase
-{
-    static TTDevice open(unsigned int device_id);
+
+    TTDevice(uint32_t device_id);
+    ~TTDevice();
+
+    // TODO(jms): get this out of here
     void open_hugepage_per_host_mem_ch(uint32_t num_host_mem_channels);
-    ~TTDevice() { reset(); }
-
-    TTDevice(const TTDevice&) = delete;
-    void operator = (const TTDevice&) = delete;
-
-    TTDevice(TTDevice &&that) : TTDeviceBase(std::move(that)) { that.drop(); }
-    TTDevice &operator = (TTDevice &&that) {
-        reset();
-
-        *static_cast<TTDeviceBase*>(this) = std::move(that);
-        that.drop();
-
-        return *this;
-    }
-
-    void suspend_before_device_reset() {
-        reset();
-    }
-
-    void resume_after_device_reset() {
-        do_open();
-    }
-
-private:
-    TTDevice() = default;
-
-    void reset();
-    void drop();
-    void do_open();
 };
+
+PCIdevice ttkmd_open(DWORD device_id);
