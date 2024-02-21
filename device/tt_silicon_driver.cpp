@@ -57,6 +57,7 @@
 #include "device/cpuset_lib.hpp"
 #include "common/logger.hpp"
 #include "device/driver_atomics.h"
+#include "device/tt_pci_device.h"
 
 #define WHT "\e[0;37m"
 #define BLK "\e[0;30m"
@@ -109,7 +110,6 @@ const std::string tlb_large_write_mutex_name_prefix = "mem_tlb_large_write_mutex
 const std::string tlb_small_read_write_mutex_name_prefix = "mem_tlb_small_read_write_mutex_pci_interface_id_";
 const std::string arc_msg_mutex_name_prefix = "arc_msg_mutex_pci_interface_id_";
 
-static uint32_t GS_BAR0_WC_MAPPING_SIZE = (156<<20) + (10<<21) + (18<<24);
 
 const uint32_t DMA_BUF_REGION_SIZE = 4 << 20;
 const uint32_t HUGEPAGE_REGION_SIZE = 1 << 30; // 1GB
@@ -130,125 +130,6 @@ uint32_t pcie_dma_transfer_turbo (TTDevice *dev, uint32_t chip_addr, uint32_t ho
 DMAbuffer pci_allocate_dma_buffer(TTDevice *dev, uint32_t size);
 void pcie_init_dma_transfer_turbo (PCIdevice* dev);
 
-// Stash all the fields of TTDevice in TTDeviceBase to make moving simpler.
-struct TTDeviceBase
-{
-    unsigned int index;
-
-    int device_fd = -1;
-    std::vector<int> device_fd_per_host_ch;
-    void *bar0_uc = nullptr;
-    std::size_t bar0_uc_size = 0;
-    std::size_t bar0_uc_offset = 0;
-
-    void *bar0_wc = nullptr;
-    std::size_t bar0_wc_size = 0;
-
-    void *system_reg_mapping = nullptr;
-    std::size_t system_reg_mapping_size;
-
-    void *system_reg_wc_mapping = nullptr;
-    std::size_t system_reg_wc_mapping_size;
-
-    std::uint32_t system_reg_start_offset;  // Registers >= this are system regs, use the mapping.
-    std::uint32_t system_reg_offset_adjust; // This is the offset of the first reg in the system reg mapping.
-
-    int sysfs_config_fd = -1;
-    std::uint16_t pci_domain;
-    std::uint8_t pci_bus;
-    std::uint8_t pci_device;
-    std::uint8_t pci_function;
-
-    unsigned int next_dma_buf = 0;
-
-	DMAbuffer dma_completion_flag_buffer;  // When DMA completes, it writes to this buffer
-	DMAbuffer dma_transfer_buffer;         // Buffer for large DMA transfers
-
-    std::uint32_t max_dma_buf_size_log2;
-
-    tenstorrent_get_device_info_out device_info;
-
-    std::vector<DMAbuffer> dma_buffer_mappings;
-};
-
-struct TTDevice : TTDeviceBase
-{
-    static TTDevice open(unsigned int device_id);
-    void open_hugepage_per_host_mem_ch(uint32_t num_host_mem_channels);
-    ~TTDevice() { reset(); }
-
-    TTDevice(const TTDevice&) = delete;
-    void operator = (const TTDevice&) = delete;
-
-    TTDevice(TTDevice &&that) : TTDeviceBase(std::move(that)) { that.drop(); }
-    TTDevice &operator = (TTDevice &&that) {
-        reset();
-
-        *static_cast<TTDeviceBase*>(this) = std::move(that);
-        that.drop();
-
-        return *this;
-    }
-
-    void suspend_before_device_reset() {
-        reset();
-    }
-
-    void resume_after_device_reset() {
-        do_open();
-    }
-
-private:
-    TTDevice() = default;
-
-    void reset() {
-        if (device_fd != -1) {
-            close(device_fd);
-        }
-
-        if (bar0_wc != nullptr && bar0_wc != MAP_FAILED && bar0_wc != bar0_uc) {
-            munmap(bar0_wc, bar0_wc_size);
-        }
-
-        if (bar0_uc != nullptr && bar0_uc != MAP_FAILED) {
-            munmap(bar0_uc, bar0_uc_size);
-        }
-
-        if (system_reg_mapping != nullptr && system_reg_mapping != MAP_FAILED) {
-            munmap(system_reg_mapping, system_reg_mapping_size);
-        }
-
-        for (auto &&buf : dma_buffer_mappings) {
-            munmap(buf.pBuf, buf.size);
-        }
-
-        if (sysfs_config_fd != -1) {
-            close(sysfs_config_fd);
-        }
-
-        drop();
-    }
-
-    void drop() {
-        device_fd = -1;
-        bar0_uc = nullptr;
-        bar0_wc = nullptr;
-        system_reg_mapping = nullptr;
-        dma_buffer_mappings.clear();
-        sysfs_config_fd = -1;
-    }
-
-    void do_open();
-};
-
-TTDevice TTDevice::open(unsigned int device_id) {
-    TTDevice ttdev;
-    static int unique_id = 0;
-    ttdev.index = device_id;
-    ttdev.do_open();
-
-    return ttdev;
-}
 
 bool is_grayskull(const uint16_t device_id) {
     return device_id == 0xfaca;
@@ -352,18 +233,6 @@ int find_device(const uint16_t device_id) {
     return device_fd;
 }
 
-// Open a unique device_id per host memory channel (workaround for ttkmd < 1.21 support for more than 1 pin per fd)
-void TTDevice::open_hugepage_per_host_mem_ch(uint32_t num_host_mem_channels) {
-    for (int ch = 0; ch < num_host_mem_channels; ch++) {
-        log_debug(LogSiliconDriver, "Opening device_fd_per_host_ch device index: {} ch: {} (num_host_mem_channels: {})", index, ch, num_host_mem_channels);
-        int device_fd_for_host_mem = find_device(index);
-        if (device_fd_for_host_mem == -1) {
-            throw std::runtime_error(std::string("Failed opening a host memory device handle for device ") + std::to_string(index));
-        }
-        device_fd_per_host_ch.push_back(device_fd_for_host_mem);
-    }
-}
-
 tt::ARCH detect_arch(PCIdevice *pci_device) {
     tt::ARCH arch_name = tt::ARCH::Invalid;
 
@@ -392,120 +261,6 @@ tt::ARCH detect_arch(uint16_t device_id) {
 
     ttkmd_close(pci_device);
     return arch_name;
-}
-
-void TTDevice::do_open() {
-    device_fd = find_device(index);
-    if (device_fd == -1) {
-        throw std::runtime_error(std::string("Failed opening a handle for device ") + std::to_string(index));
-    }
-
-    tenstorrent_get_device_info device_info;
-    memset(&device_info, 0, sizeof(device_info));
-    device_info.in.output_size_bytes = sizeof(device_info.out);
-
-    if (ioctl(device_fd, TENSTORRENT_IOCTL_GET_DEVICE_INFO, &device_info) == -1) {
-        throw std::runtime_error(std::string("Get device info failed on device ") + std::to_string(index) + ".");
-    }
-
-    this->device_info = device_info.out;
-
-    max_dma_buf_size_log2 = device_info.out.max_dma_buf_size_log2;
-
-    struct {
-        tenstorrent_query_mappings query_mappings;
-        tenstorrent_mapping mapping_array[8];
-    } mappings;
-
-    memset(&mappings, 0, sizeof(mappings));
-    mappings.query_mappings.in.output_mapping_count = 8;
-
-    if (ioctl(device_fd, TENSTORRENT_IOCTL_QUERY_MAPPINGS, &mappings.query_mappings) == -1) {
-        throw std::runtime_error(std::string("Query mappings failed on device ") + std::to_string(index) + ".");
-    }
-
-    tenstorrent_mapping bar0_uc_mapping;
-    tenstorrent_mapping bar0_wc_mapping;
-    tenstorrent_mapping bar2_uc_mapping;
-    tenstorrent_mapping bar2_wc_mapping;
-
-    memset(&bar0_uc_mapping, 0, sizeof(bar0_uc_mapping));
-    memset(&bar0_wc_mapping, 0, sizeof(bar0_wc_mapping));
-    memset(&bar2_uc_mapping, 0, sizeof(bar2_uc_mapping));
-    memset(&bar2_wc_mapping, 0, sizeof(bar2_wc_mapping));
-
-    for (unsigned int i = 0; i < mappings.query_mappings.in.output_mapping_count; i++) {
-        if (mappings.mapping_array[i].mapping_id == TENSTORRENT_MAPPING_RESOURCE0_UC) {
-            bar0_uc_mapping = mappings.mapping_array[i];
-        }
-
-        if (mappings.mapping_array[i].mapping_id == TENSTORRENT_MAPPING_RESOURCE0_WC) {
-            bar0_wc_mapping = mappings.mapping_array[i];
-        }
-
-        if (mappings.mapping_array[i].mapping_id == TENSTORRENT_MAPPING_RESOURCE2_UC) {
-            bar2_uc_mapping = mappings.mapping_array[i];
-        }
-
-        if (mappings.mapping_array[i].mapping_id == TENSTORRENT_MAPPING_RESOURCE2_WC) {
-            bar2_wc_mapping = mappings.mapping_array[i];
-        }
-    }
-
-    if (bar0_uc_mapping.mapping_id != TENSTORRENT_MAPPING_RESOURCE0_UC) {
-        throw std::runtime_error(std::string("Device ") + std::to_string(index) + " has no BAR0 UC mapping.");
-    }
-
-    // Attempt WC mapping first so we can fall back to all-UC if it fails.
-    if (bar0_wc_mapping.mapping_id == TENSTORRENT_MAPPING_RESOURCE0_WC) {
-        bar0_wc_size = std::min<size_t>(bar0_wc_mapping.mapping_size, GS_BAR0_WC_MAPPING_SIZE);
-        bar0_wc = mmap(NULL, bar0_wc_size, PROT_READ | PROT_WRITE, MAP_SHARED, device_fd, bar0_wc_mapping.mapping_base);
-        if (bar0_wc == MAP_FAILED) {
-            bar0_wc_size = 0;
-            bar0_wc = nullptr;
-        }
-    }
-
-    if (bar0_wc) {
-        // The bottom part of the BAR is mapped WC. Map the top UC.
-        bar0_uc_size = bar0_uc_mapping.mapping_size - GS_BAR0_WC_MAPPING_SIZE;
-        bar0_uc_offset = GS_BAR0_WC_MAPPING_SIZE;
-    } else {
-        // No WC mapping, map the entire BAR UC.
-        bar0_uc_size = bar0_uc_mapping.mapping_size;
-        bar0_uc_offset = 0;
-    }
-
-    bar0_uc = mmap(NULL, bar0_uc_size, PROT_READ | PROT_WRITE, MAP_SHARED, device_fd, bar0_uc_mapping.mapping_base + bar0_uc_offset);
-
-    if (bar0_uc == MAP_FAILED) {
-        throw std::runtime_error(std::string("BAR0 UC memory mapping failed for device ") + std::to_string(index) + ".");
-    }
-
-    if (!bar0_wc) {
-        bar0_wc = bar0_uc;
-    }
-
-    if (is_wormhole(device_info.out)) {
-        if (bar2_uc_mapping.mapping_id != TENSTORRENT_MAPPING_RESOURCE2_UC) {
-            throw std::runtime_error(std::string("Device ") + std::to_string(index) + " has no BAR4 UC mapping.");
-        }
-
-        this->system_reg_mapping_size = bar2_uc_mapping.mapping_size;
-
-        this->system_reg_mapping = mmap(NULL, bar2_uc_mapping.mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, device_fd, bar2_uc_mapping.mapping_base);
-
-        if (this->system_reg_mapping == MAP_FAILED) {
-            throw std::runtime_error(std::string("BAR4 UC memory mapping failed for device ") + std::to_string(index) + ".");
-        }
-
-        this->system_reg_start_offset = (512 - 16) * 1024*1024;
-        this->system_reg_offset_adjust = (512 - 32) * 1024*1024;
-    }
-    pci_domain = device_info.out.pci_domain;
-    pci_bus = device_info.out.bus_dev_fn >> 8;
-    pci_device = PCI_SLOT(device_info.out.bus_dev_fn);
-    pci_function = PCI_FUNC(device_info.out.bus_dev_fn);
 }
 
 void set_debug_level(int dl) {
@@ -586,6 +341,7 @@ std::vector<chip_id_t> ttkmd_scan() {
     return found_devices;
 }
 
+// TODO(jms): Put it on the class.
 int get_config_space_fd(TTDevice *dev) {
     if (dev->sysfs_config_fd == -1) {
         static const char pattern[] = "/sys/bus/pci/devices/0000:%02x:%02x.%u/config";
