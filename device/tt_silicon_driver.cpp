@@ -105,12 +105,6 @@ volatile bool msi_interrupt_received = false;
 
 const char device_name_pattern[] = "/dev/tenstorrent/%u";
 
-const std::string tlb_large_read_mutex_name_prefix = "mem_tlb_large_read_mutex_pci_interface_id_";
-const std::string tlb_large_write_mutex_name_prefix = "mem_tlb_large_write_mutex_pci_interface_id_";
-const std::string tlb_small_read_write_mutex_name_prefix = "mem_tlb_small_read_write_mutex_pci_interface_id_";
-const std::string arc_msg_mutex_name_prefix = "arc_msg_mutex_pci_interface_id_";
-
-
 const uint32_t DMA_BUF_REGION_SIZE = 4 << 20;
 const uint32_t HUGEPAGE_REGION_SIZE = 1 << 30; // 1GB
 const uint32_t DMA_MAP_MASK = DMA_BUF_REGION_SIZE - 1;
@@ -335,23 +329,6 @@ std::vector<chip_id_t> ttkmd_scan() {
     std::sort(found_devices.begin(), found_devices.end());
 
     return found_devices;
-}
-
-// TODO(jms): Put it on the class.
-int get_config_space_fd(TTDevice *dev) {
-    if (dev->sysfs_config_fd == -1) {
-        static const char pattern[] = "/sys/bus/pci/devices/0000:%02x:%02x.%u/config";
-        char buf[sizeof(pattern)];
-        std::snprintf(buf, sizeof(buf), pattern,
-                      (unsigned int)dev->pci_bus, (unsigned int)dev->pci_device, (unsigned int)dev->pci_function);
-        dev->sysfs_config_fd = open(buf, O_RDWR);
-
-        if (dev->sysfs_config_fd == -1) {
-            dev->sysfs_config_fd = open(buf, O_RDONLY);
-        }
-    }
-
-    return dev->sysfs_config_fd;
 }
 
 int get_link_width(TTDevice *dev) {
@@ -697,26 +674,6 @@ void write_block(TTDevice *dev, uint32_t byte_addr, uint32_t num_bytes, const ui
 
 void read_checking_enable(bool enable = true) {
     g_READ_CHECKING_ENABLED = enable;
-}
-
-// Read/write to the configuration space of the device
-// pData is a pointer to a buffer (see memory module)
-DWORD read_cfg(TTDevice *dev, DWORD byte_offset, uint64_t pData, DWORD num_bytes) {
-
-    if (pread(get_config_space_fd(dev), reinterpret_cast<void*>(pData), num_bytes, byte_offset) != num_bytes) {
-        throw std::runtime_error("Config space read failed for device ");
-    }
-
-    return 0;
-}
-
-DWORD write_cfg(TTDevice *dev, DWORD byte_offset, uint64_t pData, DWORD num_bytes) {
-
-    if (pwrite(get_config_space_fd(dev), reinterpret_cast<const void*>(pData), num_bytes, byte_offset) != num_bytes) {
-        throw std::runtime_error("Config space read failed for device ");
-    }
-
-    return 0;
 }
 
 DMAbuffer pci_allocate_dma_buffer(TTDevice *dev, uint32_t size) {
