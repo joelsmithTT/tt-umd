@@ -181,8 +181,9 @@ bool tt_cpuset_allocator::init_find_tt_pci_devices_packages_numanodes(){
                 m_num_cpu_cores_allocated_per_tt_device.insert({physical_device_id, 0});
 
             }else{
-                log_fatal("Could not find {} directory - this is unexpected", pci_device_dir);
-                return false;
+                // FIXME(jms): this is broken
+                // log_fatal("Could not find {} directory - this is unexpected", pci_device_dir);
+                // return false;
             }
         }
     }
