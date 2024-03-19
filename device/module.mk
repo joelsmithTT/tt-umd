@@ -147,11 +147,11 @@ ifeq ("$(HOST_ARCH)", "aarch64")
     $(error VERSIM build is not enabled for non x86 hosts)
   endif
 else
-  DEVICE_CXX ?= /usr/bin/clang++-6.0
+  DEVICE_CXX ?= /usr/bin/g++
   # Compiling VERSIM with /usr/bin/g++ causes build issues (not compatible with boost version)
   # Force clang usage.
   ifneq ($(UMD_VERSIM_STUB),1)
-    DEVICE_CXX = /usr/bin/clang++-6.0
+    DEVICE_CXX = /usr/bin/g++
   endif
 endif
 
@@ -173,8 +173,8 @@ clean_umd_device:
 
 $(UMD_DEVICE_LIB): $(DEVICE_OBJS)
 	mkdir -p $(LIBDIR)
-	$(DEVICE_CXX) $(OPT_LEVEL) $(DEBUG_FLAGS) $(CXXFLAGS) $(DEVICE_WARNINGS) $(DEVICE_CXXFLAGS) $(SHARED_LIB_FLAGS) -o $(UMD_DEVICE_LIB) $^ $(LDFLAGS) $(DEVICE_LDFLAGS)
+	$(DEVICE_CXX) -g -O0 $(OPT_LEVEL) $(DEBUG_FLAGS) $(CXXFLAGS) $(DEVICE_WARNINGS) $(DEVICE_CXXFLAGS) $(SHARED_LIB_FLAGS) -o $(UMD_DEVICE_LIB) $^ $(LDFLAGS) $(DEVICE_LDFLAGS)
 
 $(DEVICE_OBJDIR)/device/%.o: $(UMD_HOME)/device/%.cpp
 	@mkdir -p $(@D)
-	$(DEVICE_CXX) $(OPT_LEVEL) $(DEBUG_FLAGS) $(CXXFLAGS) $(DEVICE_WARNINGS) $(DEVICE_CXXFLAGS) $(STATIC_LIB_FLAGS) $(DEVICE_INCLUDES) -c -o $@ $<
+	$(DEVICE_CXX) -g -O0 $(OPT_LEVEL) $(DEBUG_FLAGS) $(CXXFLAGS) $(DEVICE_WARNINGS) $(DEVICE_CXXFLAGS) $(STATIC_LIB_FLAGS) $(DEVICE_INCLUDES) -c -o $@ $<
