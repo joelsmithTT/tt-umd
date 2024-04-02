@@ -819,6 +819,8 @@ class tt_SiliconDevice: public tt_device
 
     private:
     // Helper functions
+    std::string sysfs_path(chip_id_t logical_device_id) const;
+
     // Startup + teardown
     void create_device(const std::unordered_set<chip_id_t> &target_mmio_device_ids, const uint32_t &num_host_mem_ch_per_mmio_device, const bool skip_driver_allocs, const bool clean_system_resources);
     void initialize_interprocess_mutexes(int pci_interface_id, bool cleanup_mutexes_in_shm);
@@ -834,6 +836,8 @@ class tt_SiliconDevice: public tt_device
     void init_pcie_iatus_no_p2p();
     bool init_hugepage(chip_id_t device_id);
     bool init_dmabuf(chip_id_t device_id);
+    bool init_iommu_allocations(chip_id_t device_id);
+    void initial_allocations(chip_id_t logical_device_id);
     void check_pcie_device_initialized(int device_id);
     bool init_dma_turbo_buf(struct PCIdevice* pci_device);
     bool uninit_dma_turbo_buf(struct PCIdevice* pci_device);
@@ -851,6 +855,8 @@ class tt_SiliconDevice: public tt_device
     uint32_t get_harvested_noc_rows (uint32_t harvesting_mask);
     uint32_t get_harvested_rows (int logical_device_id);
     int get_clock(int logical_device_id);
+    bool is_iommu(chip_id_t logical_device_id) const;
+    void detect_iommu(const std::unordered_set<chip_id_t> &target_mmio_device_ids); // writes m_iommu
 
     // Communication Functions
     void read_dma_buffer(void* mem_ptr, std::uint32_t address, std::uint16_t channel, std::uint32_t size_in_bytes, chip_id_t src_device_id);
@@ -946,6 +952,7 @@ class tt_SiliconDevice: public tt_device
     std::uint64_t buf_physical_addr = 0;
     void * buf_mapping = nullptr;
     int driver_id;  
+    bool m_iommu = false;
     bool perform_harvesting_on_sdesc = false;
     bool use_ethernet_ordered_writes = true;
     bool use_ethernet_broadcast = true;

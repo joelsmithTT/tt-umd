@@ -27,6 +27,7 @@
 #include <cerrno>
 #include <chrono>
 #include <ratio>
+#include <sstream>
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -129,6 +130,17 @@ int ttkmd_close(struct PCIdevice &device);
 uint32_t pcie_dma_transfer_turbo (TTDevice *dev, uint32_t chip_addr, uint32_t host_phys_addr, uint32_t size_bytes, bool write);
 DMAbuffer pci_allocate_dma_buffer(TTDevice *dev, uint32_t size);
 void pcie_init_dma_transfer_turbo (PCIdevice* dev);
+
+// For debug purposes when various stages fails.
+void print_file_contents(std::string filename, std::string hint = ""){
+    if (std::filesystem::exists(filename)){
+        std::ifstream meminfo(filename);
+        if (meminfo.is_open()){
+            std::cout << std::endl << "File " << filename << " " << hint << " is: " << std::endl;
+            std::cout << meminfo.rdbuf();
+        }
+    }
+}
 
 // Stash all the fields of TTDevice in TTDeviceBase to make moving simpler.
 struct TTDeviceBase
@@ -1330,7 +1342,7 @@ dynamic_tlb set_dynamic_tlb(PCIdevice* dev, unsigned int tlb_index, tt_xy_pair s
         .static_vc = true,
     }.apply_offset(tlb_offset);
 
-    LOG1 ("set_dynamic_tlb() with tlb_index: %d tlb_index_offset: %d dynamic_tlb_size: %dMB tlb_base: 0x%x tlb_cfg_reg: 0x%x\n", tlb_index, tlb_index_offset, dynamic_tlb_size/(1024*1024), tlb_base, tlb_cfg_reg);
+    // LOG1 ("set_dynamic_tlb() with tlb_index: %d tlb_index_offset: %d dynamic_tlb_size: %dMB tlb_base: 0x%x tlb_cfg_reg: 0x%x\n", tlb_index, tlb_index_offset, dynamic_tlb_size/(1024*1024), tlb_base, tlb_cfg_reg);
     //write_regs(dev -> hdev, tlb_cfg_reg, 2, &tlb_data);
     write_tlb_reg(dev->hdev, tlb_cfg_reg, *tlb_data);
 
@@ -1460,9 +1472,16 @@ void tt_SiliconDevice::create_device(const std::unordered_set<chip_id_t> &target
         if (!skip_driver_allocs)
             print_device_info (*pci_device);
 
+        detect_iommu(target_mmio_device_ids);
+
         // For using silicon driver without workload to query mission mode params, no need for hugepage/dmabuf.
         if (!skip_driver_allocs){
-            bool hugepages_initialized = init_hugepage(logical_device_id);
+            bool hugepages_initialized = false;
+            if (m_iommu) {
+                init_iommu_allocations(logical_device_id);
+            } else {
+                hugepages_initialized = init_hugepage(logical_device_id);
+            }
             // Large writes to remote chips require hugepages to be initialized.
             // Conservative assert - end workload if remote chips present but hugepages not initialized (failures caused if using remote only for small transactions)
             if(target_remote_chips.size()) {
@@ -1483,6 +1502,98 @@ void tt_SiliconDevice::create_device(const std::unordered_set<chip_id_t> &target
             harvested_coord_translation.insert({chip, create_harvested_coord_translation(arch_name, true)});
         }
     }
+}
+
+namespace {
+std::string read_file(const std::string &filename) {
+    std::ifstream input(filename);
+    std::ostringstream buf;
+    buf << input.rdbuf();
+    return buf.str();
+}
+}
+
+std::string tt_SiliconDevice::sysfs_path(chip_id_t logical_device_id) const {
+    PCIdevice* dev = m_pci_device_map.at(logical_device_id);
+
+    static const char pattern[] = "/sys/bus/pci/devices/0000:%02x:%02x.%u";
+    char buf[sizeof(pattern)];
+    std::snprintf(buf, sizeof(buf), pattern, dev->dwBus, dev->dwSlot, dev->dwFunction);
+    return buf;
+}
+
+bool tt_SiliconDevice::is_iommu(chip_id_t logical_device_id) const {
+    std::string iommu_type = read_file(sysfs_path(logical_device_id) + "/iommu_group/type");
+    return iommu_type.substr(0, 3) == "DMA"; // Expecting DMA or DMA-FQ.
+}
+
+void tt_SiliconDevice::detect_iommu(const std::unordered_set<chip_id_t> &target_mmio_device_ids) {
+    bool any_iommu = false;
+    bool any_not_iommu = false;
+
+    for (auto chip : target_mmio_device_ids) {
+        if (is_iommu(chip)) {
+            any_iommu = true;
+        } else {
+            any_not_iommu = true;
+        }
+    }
+
+    if (any_iommu && any_not_iommu) {
+        throw std::runtime_error("Some devices have IOMMU enabled, but others don't. This shouldn't be possible and it isn't going to work.");
+    }
+
+    LOG1("Choosing %sIOMMU allocation.\n", (any_iommu ? "" : "non-"));
+
+    m_iommu = any_iommu;
+}
+
+bool tt_SiliconDevice::init_iommu_allocations(chip_id_t device_id) {
+    const auto physical_device_id = m_pci_device_map.at(device_id)->id;
+
+    auto mapping_size = HUGEPAGE_REGION_SIZE;
+
+    bool success = true;
+
+    for (int ch = 0; ch < m_num_host_mem_channels; ch++) {
+        void *mapping = mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
+
+        if (mapping == MAP_FAILED) {
+            WARN("---- ttSiliconDevice::init_iommu_allocations: physical_device_id: %d ch: %d mmap failed (errno: %s). Possibly out of memory, see following file contents...\n", physical_device_id, ch, strerror(errno));
+            print_file_contents("/proc/meminfo");
+            print_file_contents("/proc/buddyinfo");
+
+            success = false;
+            continue;
+        }
+
+        tenstorrent_pin_pages pin_pages;
+        memset(&pin_pages, 0, sizeof(pin_pages));
+        pin_pages.in.output_size_bytes = sizeof(pin_pages.out);
+        pin_pages.in.flags = TENSTORRENT_PIN_PAGES_INTO_IOMMU;
+        pin_pages.in.virtual_address = reinterpret_cast<std::uintptr_t>(mapping);
+        pin_pages.in.size = mapping_size;
+
+        auto &fd = g_SINGLE_PIN_PAGE_PER_FD_WORKAROND ? m_pci_device_map.at(device_id)->hdev->device_fd_per_host_ch[ch] : m_pci_device_map.at(device_id)->hdev->device_fd;
+
+        if (ioctl(fd, TENSTORRENT_IOCTL_PIN_PAGES, &pin_pages) == -1) {
+            munmap(mapping, mapping_size);
+
+            WARN("---- ttSiliconDevice::init_iommu_allocations: physical_device_id: %d ch: %d TENSTORRENT_IOCTL_PIN_PAGES failed (errno: %s). Common Issue: Requires IOMMU-enabled TTMKD, see following file contents...\n", physical_device_id, ch, strerror(errno));
+            print_file_contents("/sys/module/tenstorrent/version", "(TTKMD version)");
+            print_file_contents("/proc/meminfo");
+            print_file_contents("/proc/buddyinfo");
+
+            throw std::runtime_error("Fail");
+        }
+
+        hugepage_mapping.at(device_id).at(ch) = mapping;
+        hugepage_mapping_size.at(device_id).at(ch) = mapping_size;
+        hugepage_physical_address.at(device_id).at(ch) = pin_pages.out.physical_address;
+        PRINT("---- ttSiliconDevice::init_iommu_allocations: physical_device_id: %d ch: %d hugepage_mapping: %p hugepage_physical_address: 0x%lx\n", physical_device_id, ch, mapping, pin_pages.out.physical_address);
+    }
+
+    return success;
 }
 
 bool tt_SiliconDevice::noc_translation_en() {
@@ -2036,7 +2147,7 @@ void tt_SiliconDevice::write_device_memory(const void *mem_ptr, uint32_t size_in
 
 void tt_SiliconDevice::read_device_memory(void *mem_ptr, tt_cxy_pair target, std::uint32_t address, std::uint32_t size_in_bytes, const std::string& fallback_tlb) {
     // Assume that mem_ptr has been allocated adequate memory on host when this function is called. Otherwise, this function will cause a segfault.
-    LOG1("---- tt_SiliconDevice::read_device_memory to chip:%lu %lu-%lu at 0x%x size_in_bytes: %d\n", target.chip, target.x, target.y, address, size_in_bytes);
+    // LOG1("---- tt_SiliconDevice::read_device_memory to chip:%lu %lu-%lu at 0x%x size_in_bytes: %d\n", target.chip, target.x, target.y, address, size_in_bytes);
     struct PCIdevice* pci_device = get_pci_device(target.chip);
     TTDevice *dev = pci_device->hdev;
 
@@ -2048,16 +2159,16 @@ void tt_SiliconDevice::read_device_memory(void *mem_ptr, tt_cxy_pair target, std
         tlb_index = map_core_to_tlb(tt_xy_pair(target.x, target.y));
         tlb_data = describe_tlb(tlb_index);
     }
-    LOG1("  tlb_index: %d, tlb_data.has_value(): %d\n", tlb_index, tlb_data.has_value());
+    // LOG1("  tlb_index: %d, tlb_data.has_value(): %d\n", tlb_index, tlb_data.has_value());
 
     if (tlb_data.has_value()  && address_in_tlb_space(address, size_in_bytes, tlb_index, std::get<1>(tlb_data.value()), target.chip)) {
         auto [tlb_offset, tlb_size] = tlb_data.value();
         read_block(dev, tlb_offset + address % tlb_size, size_in_bytes, buffer_addr, m_dma_buf_size);
-        LOG1 ("  read_block called with tlb_offset: %d, tlb_size: %d\n", tlb_offset, tlb_size);
+        // LOG1 ("  read_block called with tlb_offset: %d, tlb_size: %d\n", tlb_offset, tlb_size);
     } else {
         const auto tlb_index = dynamic_tlb_config.at(fallback_tlb);
         const scoped_lock<named_mutex> lock(*get_mutex(fallback_tlb, pci_device -> id));
-        LOG1 ("  dynamic tlb_index: %d\n", tlb_index);
+        // LOG1 ("  dynamic tlb_index: %d\n", tlb_index);
         while(size_in_bytes > 0) {
 
             auto [mapped_address, tlb_size] = set_dynamic_tlb(pci_device, tlb_index, target, address, harvested_coord_translation, dynamic_tlb_ordering_modes.at(fallback_tlb));
@@ -2225,6 +2336,7 @@ tt_SiliconDevice::~tt_SiliconDevice () {
 
         chip_id_t device_id = device_it.first;
 
+
         for (int ch = 0; ch < m_num_host_mem_channels; ch ++) {
             if (hugepage_mapping.at(device_id).at(ch)) {
                 munmap(hugepage_mapping.at(device_id).at(ch), hugepage_mapping_size.at(device_id).at(ch));
@@ -2329,7 +2441,7 @@ void tt_SiliconDevice::init_pcie_iatus() {
     int ending_device_id    = m_pci_device_map.rbegin()->first;
     int num_enabled_devices = m_pci_device_map.size();
 
-    LOG1("---- tt_SiliconDevice::init_pcie_iatus() num_enabled_devices: %d starting_device_id: %d ending_device_id: %d\n", num_enabled_devices, starting_device_id, ending_device_id);
+    PRINT("---- tt_SiliconDevice::init_pcie_iatus() num_enabled_devices: %d starting_device_id: %d ending_device_id: %d\n", num_enabled_devices, starting_device_id, ending_device_id);
     log_assert(m_num_host_mem_channels <= 1, "Maximum of 1x 1GB Host memory channels supported.");
 
     // Requirement for ring topology in GS, but since WH can share below code, check it again here for mmio mapped devices,
@@ -2346,7 +2458,7 @@ void tt_SiliconDevice::init_pcie_iatus() {
 
             //TODO: migrate this to huge pages when that support is in
             if (peer_id == 0){
-                LOG2 ("Setting up src_pci_id: %d peer_id: %d to Host. current_peer_region: %d\n", src_pci_id, peer_id, current_peer_region);
+                PRINT("Setting up src_pci_id: %d peer_id: %d to Host. current_peer_region: %d\n", src_pci_id, peer_id, current_peer_region);
                 // Device to Host (peer_id==0)
                 const uint16_t host_memory_channel = 0; // Only single channel supported.
                 if (hugepage_mapping.at(src_pci_id).at(host_memory_channel)) {
@@ -2385,7 +2497,7 @@ void tt_SiliconDevice::init_pcie_iatus() {
 void tt_SiliconDevice::init_pcie_iatus_no_p2p() {
 
     int num_enabled_devices = m_pci_device_map.size();
-    LOG1("---- tt_SiliconDevice::init_pcie_iatus_no_p2p() num_enabled_devices: %d\n", num_enabled_devices);
+    PRINT("---- tt_SiliconDevice::init_pcie_iatus_no_p2p() num_enabled_devices: %d\n", num_enabled_devices);
     log_assert(m_num_host_mem_channels <= g_MAX_HOST_MEM_CHANNELS, "Maximum of {} 1GB Host memory channels supported.",  g_MAX_HOST_MEM_CHANNELS);
 
     for (auto &src_device_it : m_pci_device_map){
@@ -2563,17 +2675,6 @@ bool tt_SiliconDevice::uninit_dma_turbo_buf (struct PCIdevice* pci_device) {
     return true;
 }
 
-// For debug purposes when various stages fails.
-void print_file_contents(std::string filename, std::string hint = ""){
-    if (std::filesystem::exists(filename)){
-        std::ifstream meminfo(filename);
-        if (meminfo.is_open()){
-            std::cout << std::endl << "File " << filename << " " << hint << " is: " << std::endl;
-            std::cout << meminfo.rdbuf();
-        }
-    }
-}
-
 // Initialize hugepage, N per device (all same size).
 bool tt_SiliconDevice::init_hugepage(chip_id_t device_id) {
     const std::size_t hugepage_size = (std::size_t)1 << 30;
@@ -2639,13 +2740,14 @@ bool tt_SiliconDevice::init_hugepage(chip_id_t device_id) {
             print_file_contents("/proc/buddyinfo");
             success = false;
             continue;
+            std::terminate();
         }
 
         hugepage_mapping.at(device_id).at(ch) = mapping;
         hugepage_mapping_size.at(device_id).at(ch) = mapping_size;
         hugepage_physical_address.at(device_id).at(ch) = pin_pages.out.physical_address;
 
-        LOG1("---- ttSiliconDevice::init_hugepage: physical_device_id: %d ch: %d mapping_size: %d physical address 0x%llx\n", physical_device_id, ch, mapping_size, (unsigned long long)hugepage_physical_address.at(device_id).at(ch));
+        printf("---- ttSiliconDevice::init_hugepage: physical_device_id: %d ch: %d mapping_size: %lu physical address 0x%llx\n", physical_device_id, ch, mapping_size, (unsigned long long)hugepage_physical_address.at(device_id).at(ch));
 
     }
 
@@ -2835,7 +2937,7 @@ int tt_SiliconDevice::iatu_configure_peer_region (int logical_device_id, uint32_
     // Print what just happened
     uint32_t peer_region_start = region_id_to_use*region_size;
     uint32_t peer_region_end = (region_id_to_use+1)*region_size - 1;
-    LOG1 ("    [region id %d] NOC to PCI address range 0x%x-0x%x mapped to addr 0x%llx\n", peer_region_id, peer_region_start, peer_region_end, bar_addr_64);
+    PRINT ("    [region id %d] NOC to PCI address range 0x%x-0x%x mapped to addr 0x%llx\n", peer_region_id, peer_region_start, peer_region_end, bar_addr_64);
     return 0;
 }
 
@@ -4188,7 +4290,7 @@ void tt_SiliconDevice::read_mmio_device_register(void* mem_ptr, tt_cxy_pair core
 
     const auto tlb_index = dynamic_tlb_config.at(fallback_tlb);
     const scoped_lock<named_mutex> lock(*get_mutex(fallback_tlb, pci_device -> id));
-    LOG1 ("  dynamic tlb_index: %d\n", tlb_index);
+    // LOG1 ("  dynamic tlb_index: %d\n", tlb_index);
 
     auto [mapped_address, tlb_size] = set_dynamic_tlb(pci_device, tlb_index, core, addr, harvested_coord_translation, TLB_DATA::Strict);
     // Align block to 4bytes if needed. 
@@ -4208,7 +4310,7 @@ void tt_SiliconDevice::write_mmio_device_register(const void* mem_ptr, tt_cxy_pa
 
     const auto tlb_index = dynamic_tlb_config.at(fallback_tlb);
     const scoped_lock<named_mutex> lock(*get_mutex(fallback_tlb, pci_device -> id));
-    LOG1 ("  dynamic tlb_index: %d\n", tlb_index);
+    // LOG1 ("  dynamic tlb_index: %d\n", tlb_index);
 
     auto [mapped_address, tlb_size] = set_dynamic_tlb(pci_device, tlb_index, core, addr, harvested_coord_translation, TLB_DATA::Strict);
     // Align block to 4bytes if needed. 
@@ -4253,8 +4355,20 @@ int tt_SiliconDevice::arc_msg(int logical_device_id, uint32_t msg_code, bool wai
 void tt_SiliconDevice::send_tensix_risc_reset_to_core(const tt_cxy_pair &core, const TensixSoftResetOptions &soft_resets) {
     auto valid = soft_resets & ALL_TENSIX_SOFT_RESET;
     uint32_t valid_val = (std::underlying_type<TensixSoftResetOptions>::type) valid;
-    write_to_device(&valid_val, sizeof(uint32_t), core, 0xFFB121B0, "REG_TLB");
-    tt_driver_atomics::sfence();
+    uint32_t wrote;
+
+    for (int i = 0; i < 1024; ++i) {
+        write_to_device(&valid_val, sizeof(uint32_t), core, 0xFFB121B0, "REG_TLB");
+        tt_driver_atomics::sfence();
+
+        read_from_device(&wrote, core, 0xFFB121B0, sizeof(uint32_t), "REG_TLB");
+
+        if (valid_val == wrote) {
+            return;
+        }
+    }
+    std::cerr << "Wrote 0x" << std::hex << valid_val << " but read back 0x" << wrote << " (core=" << core.str() << ")" << std::endl;
+    std::terminate();
 }
 
 void tt_SiliconDevice::send_remote_tensix_risc_reset_to_core(const tt_cxy_pair &core, const TensixSoftResetOptions &soft_resets) {
