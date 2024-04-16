@@ -2824,6 +2824,9 @@ int tt_SiliconDevice::pcie_arc_msg(int logical_device_id, uint32_t msg_code, boo
 }
 
 int tt_SiliconDevice::iatu_configure_peer_region (int logical_device_id, uint32_t peer_region_id, uint64_t bar_addr_64, uint32_t region_size) {
+    std::cerr << "SKIPPING IATU STUFF" << std::endl;
+    return 0;
+
     // utility.INFO (f"    Setting peer_region_id {peer_region_id} to BAR addr 0x%x" % bar_addr_64)
     uint32_t dest_bar_lo = bar_addr_64 & 0xffffffff;
     uint32_t dest_bar_hi = (bar_addr_64 >> 32) & 0xffffffff;
