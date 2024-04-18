@@ -12,6 +12,7 @@ include_directories(.)
 include_directories(device)
 include_directories(device/grayskull)
 include_directories(src/firmware/riscv/grayskull)
+include_directories(src/firmware/riscv/wormhole)
 include_directories(common)
 
 add_subdirectory(third_party/fmt)
@@ -39,7 +40,7 @@ target_include_directories(device PUBLIC
 target_link_libraries(device yaml-cpp hwloc rt fmt::fmt)
 
 add_executable(hugepage-thing hugepage-thing.cpp)
-target_link_libraries(hugepage-thing device rt pthread yaml-cpp fmt::fmt)
+target_link_libraries(hugepage-thing device rt pthread yaml-cpp fmt::fmt numa)
 
 add_executable(iatu-test iatu-test.cpp)
 target_link_libraries(iatu-test device rt pthread yaml-cpp fmt::fmt)
