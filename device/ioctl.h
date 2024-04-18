@@ -48,6 +48,7 @@ struct tenstorrent_get_device_info_out {
 	__u16 bus_dev_fn;	// [0:2] function, [3:7] device, [8:15] bus
 	__u16 max_dma_buf_size_log2;	// Since 1.0
 	__u16 pci_domain;		// Since 1.23
+	__s32 numa_node;		// Since 1.28; -1 if not NUMA
 };
 
 struct tenstorrent_get_device_info {
