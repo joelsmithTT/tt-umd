@@ -963,7 +963,6 @@ class tt_SiliconDevice: public tt_device
     uint32_t m_num_host_mem_channels = 0;
     std::unordered_map<chip_id_t, std::unordered_map<int, void *>> hugepage_mapping;
     std::unordered_map<chip_id_t, std::unordered_map<int, std::size_t>> hugepage_mapping_size;
-    std::unordered_map<chip_id_t, std::unordered_map<int, std::uint64_t>> hugepage_physical_address;
     std::map<chip_id_t, std::unordered_map<std::int32_t, std::int32_t>> tlb_config_map = {};
     std::set<chip_id_t> all_target_mmio_devices;
     std::unordered_map<chip_id_t, std::vector<uint32_t>> host_channel_size;

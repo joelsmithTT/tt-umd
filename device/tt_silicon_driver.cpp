@@ -98,8 +98,6 @@ uint32_t c_ARC_MISC_CNTL_ADDRESS = 0;
 // Print all buffers smaller than this number of bytes
 uint32_t g_NUM_BYTES_TO_PRINT = 8;
 
-// Workaround for tkmd < 1.21 use device_fd_per_host_ch[ch] instead of device_fd once per channel.
-const bool g_SINGLE_PIN_PAGE_PER_FD_WORKAROND = true;
 const uint32_t g_MAX_HOST_MEM_CHANNELS = 4;
 
 volatile bool msi_interrupt_received = false;
@@ -119,10 +117,6 @@ const uint32_t DMA_MAP_MASK = DMA_BUF_REGION_SIZE - 1;
 const uint32_t HUGEPAGE_MAP_MASK = HUGEPAGE_REGION_SIZE - 1;
 
 static const uint32_t MSG_ERROR_REPLY = 0xFFFFFFFF;
-
-// Hardcode (but allow override) of path now, to support environments with other 1GB hugepage mounts not for runtime.
-const char* hugepage_dir_env = std::getenv("TT_BACKEND_HUGEPAGE_DIR");
-std::string hugepage_dir = hugepage_dir_env ? hugepage_dir_env : "/dev/hugepages-1G";
 
 // Foward declarations
 PCIdevice ttkmd_open(DWORD device_id, bool sharable /* = false */);
@@ -171,12 +165,14 @@ struct TTDeviceBase
     tenstorrent_get_device_info_out device_info;
 
     std::vector<DMAbuffer> dma_buffer_mappings;
+
+    void *tensix_dma = nullptr;
+    size_t tensix_dma_size = 0;
 };
 
 struct TTDevice : TTDeviceBase
 {
     static TTDevice open(unsigned int device_id);
-    void open_hugepage_per_host_mem_ch(uint32_t num_host_mem_channels);
     ~TTDevice() { reset(); }
 
     TTDevice(const TTDevice&) = delete;
@@ -231,6 +227,10 @@ private:
 
         if (sysfs_config_fd != -1) {
             close(sysfs_config_fd);
+        }
+
+        if (tensix_dma && tensix_dma != MAP_FAILED) {
+            munmap(tensix_dma, tensix_dma_size);
         }
 
         drop();
@@ -307,71 +307,14 @@ uint32_t get_num_hugepages(){
 
 }
 
-// Dynamically figure out how many host memory channels (based on hugepages installed) for each device, based on arch.
-uint32_t get_available_num_host_mem_channels(const uint32_t num_channels_per_device_target, const uint16_t device_id, const uint16_t revision_id) {
-
-    // To minimally support hybrid dev systems with mix of ARCH, get only devices matching current ARCH's device_id.
-    uint32_t total_num_tt_mmio_devices      = tt::cpuset::tt_cpuset_allocator::get_num_tt_pci_devices();
-    uint32_t num_tt_mmio_devices_for_arch   = tt::cpuset::tt_cpuset_allocator::get_num_tt_pci_devices_by_pci_device_id(device_id, revision_id);
-    uint32_t total_hugepages                = get_num_hugepages();
-
-    // This shouldn't happen on silicon machines.
-    if (num_tt_mmio_devices_for_arch == 0) {
-        log_warning(LogSiliconDriver,
-            "No TT devices found that match PCI device_id: 0x{:x} revision: {}, returning NumHostMemChannels:0",
-            device_id, revision_id);
-        return 0;
-    }
-
-    // GS will use P2P + 1 channel, others may support 4 host channels. Apply min of 1 to not completely break setups that were incomplete
-    // ie fewer hugepages than devices, which would partially work previously for some devices.
-    uint32_t num_channels_per_device_available = std::min(num_channels_per_device_target, std::max((uint32_t) 1, total_hugepages / num_tt_mmio_devices_for_arch));
-
-    // Perform some helpful assertion checks to guard against common pitfalls that would show up as runtime issues later on.
-    if (total_num_tt_mmio_devices > num_tt_mmio_devices_for_arch) {
-        log_warning(LogSiliconDriver,
-            "Hybrid system mixing different TTDevices - this is not well supported. Ensure sufficient Hugepages/HostMemChannels per device.");
-    }
-
-    if (total_hugepages < num_tt_mmio_devices_for_arch) {
-        log_warning(LogSiliconDriver,
-            "Insufficient NumHugepages: {} should be at least NumMMIODevices: {} for device_id: 0x{:x} revision: {}. NumHostMemChannels would be 0, bumping to 1.",
-            total_hugepages, num_tt_mmio_devices_for_arch, device_id, revision_id);
-    }
-
-    if (num_channels_per_device_available < num_channels_per_device_target) {
-        log_warning(LogSiliconDriver,
-            "NumHostMemChannels: {} used for device_id: 0x{:x} less than target: {}. Workload will fail if it exceeds NumHostMemChannels. Increase Number of Hugepages.",
-            num_channels_per_device_available, device_id, num_channels_per_device_target);
-    }
-
-    log_assert(num_channels_per_device_available <= g_MAX_HOST_MEM_CHANNELS,
-        "NumHostMemChannels: {} exceeds supported maximum: {}, this is unexpected.",
-        num_channels_per_device_available, g_MAX_HOST_MEM_CHANNELS);
-
-    return num_channels_per_device_available;
-
-}
-
 int find_device(const uint16_t device_id) {
     // returns device id if found, otherwise -1
     char device_name[sizeof(device_name_pattern) + std::numeric_limits<unsigned int>::digits10];
     std::snprintf(device_name, sizeof(device_name), device_name_pattern, (unsigned int)device_id);
     int device_fd = ::open(device_name, O_RDWR | O_CLOEXEC);
     LOG2 ("find_device() open call returns device_fd: %d for device_name: %s (device_id: %d)\n", device_fd, device_name, device_id);
+    PRINT ("find_device() open call returns device_fd: %d for device_name: %s (device_id: %d)\n", device_fd, device_name, device_id);
     return device_fd;
-}
-
-// Open a unique device_id per host memory channel (workaround for ttkmd < 1.21 support for more than 1 pin per fd)
-void TTDevice::open_hugepage_per_host_mem_ch(uint32_t num_host_mem_channels) {
-    for (int ch = 0; ch < num_host_mem_channels; ch++) {
-        log_debug(LogSiliconDriver, "Opening device_fd_per_host_ch device index: {} ch: {} (num_host_mem_channels: {})", index, ch, num_host_mem_channels);
-        int device_fd_for_host_mem = find_device(index);
-        if (device_fd_for_host_mem == -1) {
-            throw std::runtime_error(std::string("Failed opening a host memory device handle for device ") + std::to_string(index));
-        }
-        device_fd_per_host_ch.push_back(device_fd_for_host_mem);
-    }
 }
 
 int get_revision_id(TTDevice *dev);
@@ -440,6 +383,7 @@ void TTDevice::do_open() {
     tenstorrent_mapping bar0_wc_mapping;
     tenstorrent_mapping bar2_uc_mapping;
     tenstorrent_mapping bar2_wc_mapping;
+    tenstorrent_mapping tensix_dma_mapping{};
 
     memset(&bar0_uc_mapping, 0, sizeof(bar0_uc_mapping));
     memset(&bar0_wc_mapping, 0, sizeof(bar0_wc_mapping));
@@ -461,6 +405,10 @@ void TTDevice::do_open() {
 
         if (mappings.mapping_array[i].mapping_id == TENSTORRENT_MAPPING_RESOURCE2_WC) {
             bar2_wc_mapping = mappings.mapping_array[i];
+        }
+
+        if (mappings.mapping_array[i].mapping_id == TENSTORRENT_MAPPING_RESOURCE_DMA) {
+            tensix_dma_mapping = mappings.mapping_array[i];
         }
     }
 
@@ -521,6 +469,11 @@ void TTDevice::do_open() {
 
     arch = detect_arch(this);
     architecture_implementation = tt::umd::architecture_implementation::create(static_cast<tt::umd::architecture>(arch));
+
+    tensix_dma = mmap(NULL, tensix_dma_mapping.mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, device_fd, tensix_dma_mapping.mapping_base);
+    if (tensix_dma == MAP_FAILED) {
+        std::cerr << "DMA buffer memory mapping failed for device " << index << std::endl;
+    }
 }
 
 void set_debug_level(int dl) {
@@ -1373,7 +1326,7 @@ void tt_SiliconDevice::initialize_interprocess_mutexes(int pci_interface_id, boo
 void tt_SiliconDevice::create_device(const std::unordered_set<chip_id_t> &target_mmio_device_ids, const uint32_t &num_host_mem_ch_per_mmio_device, const bool skip_driver_allocs, const bool clean_system_resources) {
     m_pci_log_level = 0;
     m_dma_buf_size = 0;
-    LOG1("---- tt_SiliconDevice::tt_SiliconDevice\n");
+    LOG1("---- tt_SiliconDevice::create_device\n");
     static int unique_driver_id = 0;
     driver_id = unique_driver_id++;
 
@@ -1410,19 +1363,10 @@ void tt_SiliconDevice::create_device(const std::unordered_set<chip_id_t> &target
         *pci_device = ttkmd_open ((DWORD) pci_interface_id, false);
         pci_device->logical_id = logical_device_id;
 
-        m_num_host_mem_channels = get_available_num_host_mem_channels(num_host_mem_ch_per_mmio_device, pci_device->device_id, pci_device->revision_id);
-        log_debug(LogSiliconDriver, "Using {} Hugepages/NumHostMemChannels for TTDevice (logical_device_id: {} pci_interface_id: {} device_id: 0x{:x} revision: {})",
-            m_num_host_mem_channels, logical_device_id, pci_interface_id, pci_device->device_id, pci_device->revision_id);
-
-        if (g_SINGLE_PIN_PAGE_PER_FD_WORKAROND) {
-            pci_device->hdev->open_hugepage_per_host_mem_ch(m_num_host_mem_channels);
-        }
-
         // Initialize these. Used to be in header file.
         for (int ch = 0; ch < g_MAX_HOST_MEM_CHANNELS; ch ++) {
             hugepage_mapping[logical_device_id][ch]= nullptr;
             hugepage_mapping_size[logical_device_id][ch] = 0;
-            hugepage_physical_address[logical_device_id][ch] = 0;
         }
 
         initialize_interprocess_mutexes(pci_interface_id, clean_system_resources);
@@ -1439,7 +1383,7 @@ void tt_SiliconDevice::create_device(const std::unordered_set<chip_id_t> &target
                 log_assert(hugepages_initialized, "Hugepages must be successfully initialized if workload contains remote chips!");
             }
             uint16_t channel = 0; // Single channel sufficient for this?
-            if (not hugepage_mapping.at(logical_device_id).at(channel)) {
+            if (!hugepage_mapping.at(logical_device_id).at(channel)) {
                 init_dmabuf(logical_device_id);
             }
         }
@@ -1475,9 +1419,14 @@ std::unordered_map<chip_id_t, uint32_t> tt_SiliconDevice::get_harvesting_masks_f
     return default_harvesting_masks;
 }
 
-tt_SiliconDevice::tt_SiliconDevice(const std::string &sdesc_path, const std::string &ndesc_path, const std::set<chip_id_t> &target_devices, 
-                                   const uint32_t &num_host_mem_ch_per_mmio_device, const std::unordered_map<std::string, std::int32_t>& dynamic_tlb_config_, 
-                                   const bool skip_driver_allocs, const bool clean_system_resources, bool perform_harvesting, std::unordered_map<chip_id_t, uint32_t> simulated_harvesting_masks) : tt_device(sdesc_path) {
+tt_SiliconDevice::tt_SiliconDevice(const std::string &sdesc_path, const std::string &ndesc_path,
+                                   const std::set<chip_id_t> &target_devices, const uint32_t &num_host_mem_ch_per_mmio_device,
+                                   const std::unordered_map<std::string, std::int32_t> &dynamic_tlb_config_,
+                                   const bool skip_driver_allocs, const bool clean_system_resources, bool perform_harvesting,
+                                   std::unordered_map<chip_id_t, uint32_t> simulated_harvesting_masks)
+    : tt_device(sdesc_path)
+    , m_num_host_mem_channels(num_host_mem_ch_per_mmio_device)
+{
     std::unordered_set<chip_id_t> target_mmio_device_ids;
     target_devices_in_cluster = target_devices;
     arch_name = tt_SocDescriptor(sdesc_path).arch;
@@ -1549,7 +1498,7 @@ tt_SiliconDevice::tt_SiliconDevice(const std::string &sdesc_path, const std::str
         }
         log_assert(performed_harvesting ? translation_tables_en : true, "Using a harvested WH cluster with NOC translation disabled.");
     }
-     else if(arch_name == tt::ARCH::GRAYSKULL) {
+    else if(arch_name == tt::ARCH::GRAYSKULL) {
         // Multichip harvesting is supported for GS.
         for(auto chip_id = target_devices.begin(); chip_id != target_devices.end(); chip_id++){
             harvested_rows_per_target[*chip_id] =  get_harvested_noc_rows_for_chip(*chip_id);
@@ -1845,12 +1794,6 @@ void tt_SiliconDevice::initialize_pcie_devices() {
         check_pcie_device_initialized(device_it.first);
     }
 
-    // If requires multi-channel or doesn't support mmio-p2p, init iatus without p2p.
-    if (m_num_host_mem_channels > 1 || arch_name != tt::ARCH::GRAYSKULL) {
-        init_pcie_iatus_no_p2p();
-    } else {
-        init_pcie_iatus();
-    }
     init_membars();
     
     // https://yyz-gitlab.local.tenstorrent.com/ihamer/ll-sw/issues/25
@@ -2084,6 +2027,7 @@ void tt_SiliconDevice::read_dma_buffer(
     if(hugepage_mapping.at(src_device_id).at(channel)) {
       user_scratchspace = static_cast<char*>(hugepage_mapping.at(src_device_id).at(channel)) + (address & HUGEPAGE_MAP_MASK);
     } else if (buf_mapping) {
+        // TODO(jms): does anyone rely on this??
       user_scratchspace = static_cast<char*>(buf_mapping) + (address & DMA_MAP_MASK);
     } else {
       std::string err_msg = "write_dma_buffer: Hugepage or DMAbuffer are not allocated for src_device_id: " + std::to_string(src_device_id) + " ch: " + std::to_string(channel);
@@ -2222,15 +2166,6 @@ tt_SiliconDevice::~tt_SiliconDevice () {
     cleanup_shared_host_state();
 
     for (auto &device_it : m_pci_device_map){
-
-        chip_id_t device_id = device_it.first;
-
-        for (int ch = 0; ch < m_num_host_mem_channels; ch ++) {
-            if (hugepage_mapping.at(device_id).at(ch)) {
-                munmap(hugepage_mapping.at(device_id).at(ch), hugepage_mapping_size.at(device_id).at(ch));
-            }
-        }
-
         struct PCIdevice* pci_device = device_it.second;
 
         ttkmd_close (*pci_device);
@@ -2323,96 +2258,6 @@ void tt_SiliconDevice::set_fallback_tlb_ordering_mode(const std::string& fallbac
     // return ret_val;
 //}
 
-// Set up IATU for peer2peer
-// Consider changing this function
-void tt_SiliconDevice::init_pcie_iatus() {
-
-    int starting_device_id  = m_pci_device_map.begin()->first;
-    int ending_device_id    = m_pci_device_map.rbegin()->first;
-    int num_enabled_devices = m_pci_device_map.size();
-
-    LOG1("---- tt_SiliconDevice::init_pcie_iatus() num_enabled_devices: %d starting_device_id: %d ending_device_id: %d\n", num_enabled_devices, starting_device_id, ending_device_id);
-    log_assert(m_num_host_mem_channels <= 1, "Maximum of 1x 1GB Host memory channels supported.");
-
-    // Requirement for ring topology in GS, but since WH can share below code, check it again here for mmio mapped devices,
-    // otherwise us/ds device calculations will not be correct. Don't expect to see this for Wormhole today.
-    log_assert((starting_device_id + num_enabled_devices - 1) == ending_device_id, "The set of workload mmio-mapped target_device_id's must be sequential, without gaps.");
-
-    for (auto &src_device_it : m_pci_device_map){
-        int src_pci_id = src_device_it.first;
-        struct PCIdevice* src_pci_device = src_device_it.second;
-
-        uint32_t current_peer_region = 0;
-        const int num_peer_ids = 3; // 0=HOST, 1=UPSTREAM Device, 2=DOWNSTREAM Device, 3=Unused
-        for (int peer_id = 0; peer_id < num_peer_ids; peer_id++) {
-
-            //TODO: migrate this to huge pages when that support is in
-            if (peer_id == 0){
-                LOG2 ("Setting up src_pci_id: %d peer_id: %d to Host. current_peer_region: %d\n", src_pci_id, peer_id, current_peer_region);
-                // Device to Host (peer_id==0)
-                const uint16_t host_memory_channel = 0; // Only single channel supported.
-                if (hugepage_mapping.at(src_pci_id).at(host_memory_channel)) {
-                    iatu_configure_peer_region(src_pci_id, current_peer_region, hugepage_physical_address.at(src_pci_id).at(host_memory_channel), HUGEPAGE_REGION_SIZE);
-                    host_channel_size.insert({src_pci_device -> logical_id, {HUGEPAGE_REGION_SIZE}});
-                } else if(buf_mapping) {
-                    // we failed when initializing huge pages, we are using a 1MB DMA buffer as a stand-in
-                    iatu_configure_peer_region(src_pci_id, current_peer_region, buf_physical_addr, DMA_BUF_REGION_SIZE);
-                }
-            } else if (peer_id == 1 || peer_id == 2){
-                // Device to Device (peer_id==1 : Upstream, peer_id==2 : Downstream)
-                // For determining upstream/downstream peers in ring topology - this matches is_target_device_downstream() in net2pipe
-                int upstream_peer_device_id = src_pci_id > starting_device_id ? src_pci_id - 1 : ending_device_id;
-                int downstream_peer_device_id = src_pci_id < (ending_device_id) ? src_pci_id + 1 : starting_device_id;
-
-                int peer_device_id = peer_id == 1 ? upstream_peer_device_id : downstream_peer_device_id;
-
-                struct PCIdevice* peer_pci_device = m_pci_device_map.at(peer_device_id);
-                uint64_t peer_BAR_addr = peer_pci_device->BAR_addr;
-                uint32_t peer_pci_interface_id = peer_pci_device->id;
-                uint32_t TLB1_16MB_OFFSET = 0; // Was 192MB offset to DRAM, now added by net2pipe since ATU maps to base of 512MB PCI Bar.
-                uint32_t PEER_REGION_SIZE = 1024 * 1024 * 1024; // Was 256MB. Want 512MB. Updated to 1024MB to match net2pipe more easily.
-                // FIXME - How to reduce PEER_REGION_SIZE=256 again, and make this still work? Need to make the ATU mappings non-contiguous 256MB chunks (every 1GB?) to match net2pipe?
-
-                LOG2 ("Setting up src_pci_id: %d peer_id: %d to Device (upstream_peer_device_id: %d downstream_peer_device_id: %d) gives peer_device_id: %d (peer_pci_interface_id: %d) current_peer_region: %d\n",
-                    src_pci_id, peer_id, upstream_peer_device_id, downstream_peer_device_id, peer_device_id, peer_pci_interface_id, current_peer_region );
-
-                iatu_configure_peer_region (src_pci_id, current_peer_region, peer_BAR_addr + TLB1_16MB_OFFSET, PEER_REGION_SIZE);
-            }
-            current_peer_region ++;
-        }
-    }
-}
-
-// TT<->TT P2P support removed in favor of increased Host memory.
-void tt_SiliconDevice::init_pcie_iatus_no_p2p() {
-
-    int num_enabled_devices = m_pci_device_map.size();
-    LOG1("---- tt_SiliconDevice::init_pcie_iatus_no_p2p() num_enabled_devices: %d\n", num_enabled_devices);
-    log_assert(m_num_host_mem_channels <= g_MAX_HOST_MEM_CHANNELS, "Maximum of {} 1GB Host memory channels supported.",  g_MAX_HOST_MEM_CHANNELS);
-
-    for (auto &src_device_it : m_pci_device_map){
-        int src_pci_id = src_device_it.first;
-        struct PCIdevice* src_pci_device = src_device_it.second;
-
-        // Device to Host (multiple channels)
-        for (int channel_id = 0; channel_id < m_num_host_mem_channels; channel_id++) {
-            // TODO - Try to remove DMA buffer support.
-            if (hugepage_mapping.at(src_pci_id).at(channel_id)) {
-                std::uint32_t region_size = HUGEPAGE_REGION_SIZE;
-                if(channel_id == 3) region_size = 805306368; // Remove 256MB from full 1GB for channel 3 (iATU limitation)
-                iatu_configure_peer_region(src_pci_id, channel_id, hugepage_physical_address.at(src_pci_id).at(channel_id), region_size);
-                if(host_channel_size.find(src_pci_device -> logical_id) == host_channel_size.end()) {
-                     host_channel_size.insert({src_pci_device -> logical_id, {}});
-                }
-                host_channel_size.at(src_pci_device -> logical_id).push_back(region_size);
-            } else if(buf_mapping) {
-                // we failed when initializing huge pages, we are using a 1MB DMA buffer as a stand-in
-                iatu_configure_peer_region(src_pci_id, channel_id, buf_physical_addr, DMA_BUF_REGION_SIZE);
-            }
-        }
-    }
-}
-
 uint32_t tt_SiliconDevice::dma_allocation_size(chip_id_t src_device_id)
 {
 
@@ -2427,96 +2272,6 @@ uint32_t tt_SiliconDevice::dma_allocation_size(chip_id_t src_device_id)
     log_fatal("Nothing has been allocated yet");
     return 0;
   }
-}
-
-
-
-
-// Looks for hugetlbfs inside /proc/mounts matching desired pagesize (typically 1G)
-std::string find_hugepage_dir(std::size_t pagesize)
-{
-
-    static const std::regex hugetlbfs_mount_re("^(nodev|hugetlbfs) (" + hugepage_dir + ") hugetlbfs ([^ ]+) 0 0$");
-    static const std::regex pagesize_re("(?:^|,)pagesize=([0-9]+)([KMGT])(?:,|$)");
-
-    std::ifstream proc_mounts("/proc/mounts");
-
-    for (std::string line; std::getline(proc_mounts, line); )
-    {
-        if (std::smatch mount_match; std::regex_match(line, mount_match, hugetlbfs_mount_re))
-        {
-            std::string options = mount_match[3];
-            if (std::smatch pagesize_match; std::regex_search(options, pagesize_match, pagesize_re))
-            {
-                std::size_t mount_page_size = std::stoull(pagesize_match[1]);
-                switch (pagesize_match[2].str()[0])
-                {
-                    case 'T': mount_page_size <<= 10;
-                    case 'G': mount_page_size <<= 10;
-                    case 'M': mount_page_size <<= 10;
-                    case 'K': mount_page_size <<= 10;
-                }
-
-                if (mount_page_size == pagesize)
-                {
-                    return mount_match[2];
-                }
-            }
-        }
-    }
-
-    WARN("---- ttSiliconDevice::find_hugepage_dir: no huge page mount found in /proc/mounts for path: %s with hugepage_size: %d.\n", hugepage_dir.c_str(), pagesize);
-    return std::string();
-}
-
-// Open a file in <hugepage_dir> for the hugepage mapping.
-// All processes operating on the same pipeline must agree on the file name.
-// Today we assume there's only one pipeline running within the system.
-// One hugepage per device such that each device gets unique memory.
-int tt_SiliconDevice::open_hugepage_file(const std::string &dir, chip_id_t physical_device_id, uint16_t channel) {
-    std::vector<char> filename;
-    static const char pipeline_name[] = "tenstorrent";
-
-    filename.insert(filename.end(), dir.begin(), dir.end());
-    if (filename.back() != '/') filename.push_back('/');
-
-    // In order to limit number of hugepages while transition from shared hugepage (1 per system) to unique
-    // hugepage per device, will share original/shared hugepage filename with physical device 0.
-    if (physical_device_id != 0 || channel != 0){
-        std::string device_id_str = "device_" + std::to_string((int)physical_device_id) + "_";
-        filename.insert(filename.end(), device_id_str.begin(), device_id_str.end());
-    }
-
-    if (channel != 0) {
-        std::string channel_id_str = "channel_" + std::to_string(channel) + "_";
-        filename.insert(filename.end(), channel_id_str.begin(), channel_id_str.end());
-    }
-
-    filename.insert(filename.end(), std::begin(pipeline_name), std::end(pipeline_name)); // includes NUL terminator
-
-    std::string filename_str(filename.begin(), filename.end());
-    filename_str.erase(std::find(filename_str.begin(), filename_str.end(), '\0'), filename_str.end()); // Erase NULL terminator for printing.
-    LOG1("---- ttSiliconDevice::open_hugepage_file: using filename: %s for physical_device_id: %d channel: %d\n", filename_str.c_str(), physical_device_id, channel);
-
-    // Save original and set umask to unrestricted.
-    auto old_umask = umask(0);
-
-    int fd = open(filename.data(), O_RDWR | O_CREAT | O_CLOEXEC, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IWOTH | S_IROTH );
-    if (fd == -1 && errno == EACCES) {
-        WARN("---- ttSiliconDevice::open_hugepage_file could not open filename: %s on first try, unlinking it and retrying.\n", filename_str.c_str());
-        unlink(filename.data());
-        fd = open(filename.data(), O_RDWR | O_CREAT | O_CLOEXEC, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IWOTH | S_IROTH );
-    }
-
-    // Restore original mask
-    umask(old_umask);
-
-    if (fd == -1) {
-        WARN("---- open_hugepage_file failed\n");
-        return -1;
-    }
-
-    return fd;
 }
 
 bool tt_SiliconDevice::init_dmabuf(chip_id_t device_id) {
@@ -2578,80 +2333,24 @@ void print_file_contents(std::string filename, std::string hint = ""){
 
 // Initialize hugepage, N per device (all same size).
 bool tt_SiliconDevice::init_hugepage(chip_id_t device_id) {
-    const std::size_t hugepage_size = (std::size_t)1 << 30;
-    const std::size_t mapping_size = (std::size_t) HUGEPAGE_REGION_SIZE;
+    size_t tensix_dma_size = m_pci_device_map.at(device_id)->hdev->tensix_dma_size;
+    void *tensix_dma = m_pci_device_map.at(device_id)->hdev->tensix_dma;
+    uint8_t *buffer = reinterpret_cast<uint8_t*>(tensix_dma);
 
-    // Convert from logical (device_id in netlist) to physical device_id (in case of virtualization)
-    auto physical_device_id = m_pci_device_map.at(device_id)->id;
-
-    std::string hugepage_dir = find_hugepage_dir(hugepage_size);
-    if (hugepage_dir.empty()) {
-        WARN("---- ttSiliconDevice::init_hugepage: no huge page mount found for hugepage_size: %d.\n", hugepage_size);
+    if (!tensix_dma) {
         return false;
     }
 
-    bool success = true;
-
-    // Support for more than 1GB host memory accessible per device, via channels.
+    // Maintain the illusion of channels even though the concept is deprecated.
     for (int ch = 0; ch < m_num_host_mem_channels; ch++) {
-
-        int hugepage_fd = open_hugepage_file(hugepage_dir, physical_device_id, ch);
-        if (hugepage_fd == -1) {
-            // Probably a permissions problem.
-            WARN("---- ttSiliconDevice::init_hugepage: physical_device_id: %d ch: %d creating hugepage mapping file failed.\n", physical_device_id, ch);
-            success = false;
-            continue;
-        }
-
-        std::byte *mapping = static_cast<std::byte*>(mmap(nullptr, mapping_size, PROT_READ|PROT_WRITE, MAP_SHARED | MAP_POPULATE, hugepage_fd, 0));
-
-        close(hugepage_fd);
-
-        if (mapping == MAP_FAILED) {
-            uint32_t num_tt_mmio_devices_for_arch = tt::cpuset::tt_cpuset_allocator::get_num_tt_pci_devices_by_pci_device_id(m_pci_device_map.at(device_id)->device_id, m_pci_device_map.at(device_id)->revision_id);
-            WARN("---- ttSiliconDevice::init_hugepage: physical_device_id: %d ch: %d mapping hugepage failed. (errno: %s).\n", physical_device_id, ch, strerror(errno));
-            WARN("---- Possible hint: /proc/cmdline should have hugepages=N, nr_hugepages=N - (N = NUM_MMIO_TT_DEVICES * (is_grayskull ? 1 : 4). NUM_MMIO_DEVICES = %d\n", num_tt_mmio_devices_for_arch);
-            print_file_contents("/proc/cmdline");\
-            print_file_contents("/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages"); // Hardcoded for 1GB hugepage.
-            success = false;
-            continue;
-        }
-
-        // Beter performance if hugepage just allocated (populate flag to prevent lazy alloc) is migrated to same numanode as TT device.
-        if (!tt::cpuset::tt_cpuset_allocator::bind_area_to_memory_nodeset(physical_device_id, mapping, mapping_size)){
-            WARN("---- ttSiliconDevice::init_hugepage: bind_area_to_memory_nodeset() failed (physical_device_id: %d ch: %d). "
-            "Hugepage allocation is not on NumaNode matching TT Device. Side-Effect is decreased Device->Host perf (Issue #893).\n",
-            physical_device_id, ch);
-        }
-
-        tenstorrent_pin_pages pin_pages;
-        memset(&pin_pages, 0, sizeof(pin_pages));
-        pin_pages.in.output_size_bytes = sizeof(pin_pages.out);
-        pin_pages.in.flags = TENSTORRENT_PIN_PAGES_CONTIGUOUS;
-        pin_pages.in.virtual_address = reinterpret_cast<std::uintptr_t>(mapping);
-        pin_pages.in.size = mapping_size;
-
-        auto &fd = g_SINGLE_PIN_PAGE_PER_FD_WORKAROND ? m_pci_device_map.at(device_id)->hdev->device_fd_per_host_ch[ch] : m_pci_device_map.at(device_id)->hdev->device_fd;
-
-        if (ioctl(fd, TENSTORRENT_IOCTL_PIN_PAGES, &pin_pages) == -1) {
-            WARN("---- ttSiliconDevice::init_hugepage: physical_device_id: %d ch: %d TENSTORRENT_IOCTL_PIN_PAGES failed (errno: %s). Common Issue: Requires TTMKD >= 1.11, see following file contents...\n", physical_device_id, ch, strerror(errno));
-            munmap(mapping, mapping_size);
-            print_file_contents("/sys/module/tenstorrent/version", "(TTKMD version)");
-            print_file_contents("/proc/meminfo");
-            print_file_contents("/proc/buddyinfo");
-            success = false;
-            continue;
-        }
-
-        hugepage_mapping.at(device_id).at(ch) = mapping;
-        hugepage_mapping_size.at(device_id).at(ch) = mapping_size;
-        hugepage_physical_address.at(device_id).at(ch) = pin_pages.out.physical_address;
-
-        LOG1("---- ttSiliconDevice::init_hugepage: physical_device_id: %d ch: %d mapping_size: %d physical address 0x%llx\n", physical_device_id, ch, mapping_size, (unsigned long long)hugepage_physical_address.at(device_id).at(ch));
-
+        uint64_t offset = ch * (1UL << 30); // 1GB per "channel"
+        uint64_t size = std::min(tensix_dma_size, 1UL << 30);
+        hugepage_mapping[device_id][ch] = buffer + offset;
+        hugepage_mapping_size[device_id][ch] = size;
+        tensix_dma_size -= size;
     }
 
-    return success;
+    return true;
 }
 
 int tt_SiliconDevice::test_setup_interface () {
@@ -2921,7 +2620,6 @@ void *tt_SiliconDevice::channel_0_address(std::uint32_t offset, std::uint32_t de
 }
 
 void *tt_SiliconDevice::host_dma_address(std::uint64_t offset, chip_id_t src_device_id, uint16_t channel) const {
-
     if (hugepage_mapping.at(src_device_id).at(channel) != nullptr) {
         return static_cast<std::byte*>(hugepage_mapping.at(src_device_id).at(channel)) + offset;
     } else {
