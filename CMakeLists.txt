@@ -39,8 +39,8 @@ target_include_directories(device PUBLIC
 
 target_link_libraries(device yaml-cpp hwloc rt fmt::fmt)
 
-add_executable(hugepage-thing hugepage-thing.cpp)
-target_link_libraries(hugepage-thing device rt pthread yaml-cpp fmt::fmt numa)
+add_executable(hugepage-setup device/hugepage-setup.cpp device/hugepages.cpp)
+target_link_libraries(hugepage-setup numa)
 
 add_executable(iatu-test iatu-test.cpp)
 target_link_libraries(iatu-test device rt pthread yaml-cpp fmt::fmt)

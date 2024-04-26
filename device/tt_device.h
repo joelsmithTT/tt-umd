@@ -965,7 +965,6 @@ class tt_SiliconDevice: public tt_device
     std::unordered_map<chip_id_t, std::unordered_map<int, std::size_t>> hugepage_mapping_size;
     std::map<chip_id_t, std::unordered_map<std::int32_t, std::int32_t>> tlb_config_map = {};
     std::set<chip_id_t> all_target_mmio_devices;
-    std::unordered_map<chip_id_t, std::vector<uint32_t>> host_channel_size;
     std::function<std::int32_t(tt_xy_pair)> map_core_to_tlb;
     std::unordered_map<std::string, std::int32_t> dynamic_tlb_config = {};
     std::unordered_map<std::string, uint64_t> dynamic_tlb_ordering_modes = {};

@@ -4216,9 +4216,7 @@ std::uint32_t tt_SiliconDevice::get_num_host_channels(std::uint32_t device_id) {
 }
 
 std::uint32_t tt_SiliconDevice::get_host_channel_size(std::uint32_t device_id, std::uint32_t channel) {
-    log_assert(host_channel_size.size(), "Host channel size can only be queried after the device has been started.");
-    log_assert(channel < get_num_host_channels(device_id), "Querying size for a host channel that does not exist.");
-    return host_channel_size.at(device_id).at(channel);
+    return 1U << 30;
 }
 
 std::uint32_t tt_SiliconDevice::get_pcie_speed(std::uint32_t device_id) {

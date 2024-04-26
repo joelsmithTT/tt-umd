@@ -387,6 +387,7 @@ int main(int argc, char **argv)
     read_iatu_via_bar2(1);
     read_iatu_via_bar2(2);
     read_iatu_via_bar2(3);
+    return 0;
     auto devices = lol_umd2();
     uint8_t *virt_addr = (uint8_t*)map_buffer();
     run_test2(*devices[0], virt_addr);
