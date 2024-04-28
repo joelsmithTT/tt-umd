@@ -73,9 +73,21 @@
 static const size_t ONE_GIG = 1024 * 1024 * 1024;
 static const size_t NUM_HUGEPAGES_PER_CARD = 4;
 
+static void reclaim_hugepages_from_hugetlbfs()
+{
+    // Remove anything with 'tenstorrent' in /dev/hugepages-1G
+    for (const auto &entry : std::filesystem::directory_iterator("/dev/hugepages-1G")) {
+        if (entry.path().string().find("tenstorrent") != std::string::npos) {
+            std::filesystem::remove(entry.path());
+        }
+    }
+}
+
 int hugepage_setup_for_device(int fd)
 {
     tenstorrent_hugepage_setup hugepage_setup{};
+
+    reclaim_hugepages_from_hugetlbfs();
 
     // Cause the driver to relinquish any hugepages it has already mapped.
     hugepage_setup.num_hugepages = 0;

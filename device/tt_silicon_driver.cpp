@@ -59,6 +59,7 @@
 #include "device/cpuset_lib.hpp"
 #include "common/logger.hpp"
 #include "device/driver_atomics.h"
+#include "device/hugepages.hpp"
 
 #define WHT "\e[0;37m"
 #define BLK "\e[0;30m"
@@ -127,6 +128,7 @@ std::string hugepage_dir = hugepage_dir_env ? hugepage_dir_env : "/dev/hugepages
 // Foward declarations
 PCIdevice ttkmd_open(DWORD device_id, bool sharable /* = false */);
 int ttkmd_close(struct PCIdevice &device);
+int find_device(const uint16_t device_id);
 
 uint32_t pcie_dma_transfer_turbo (TTDevice *dev, uint32_t chip_addr, uint32_t host_phys_addr, uint32_t size_bytes, bool write);
 DMAbuffer pci_allocate_dma_buffer(TTDevice *dev, uint32_t size);
@@ -171,6 +173,16 @@ struct TTDeviceBase
     tenstorrent_get_device_info_out device_info;
 
     std::vector<DMAbuffer> dma_buffer_mappings;
+
+    // TT-KMD 1.28 and above is capable of managing each device's sysmem buffer.
+    // Note: There are some caveats to this; see remarks in hugepages.cpp.
+    //
+    // The buffer's mmap size and offset parameters are queryable via the same
+    // query mechanism that we use to discover BAR0 WC/UC and BAR4's info.  If
+    // sysmem and sysmem_size are non-null and non-zero respectively, the intent
+    // is for UMD to use this buffer rather than managing the 1G pages scheme.
+    void *sysmem = nullptr;
+    size_t sysmem_size = 0;
 };
 
 struct TTDevice : TTDeviceBase
@@ -205,6 +217,8 @@ struct TTDevice : TTDeviceBase
     tt::ARCH get_arch() const { return arch; }
     tt::umd::architecture_implementation* get_architecture_implementation() const { return architecture_implementation.get(); }
 
+    bool kmd_supports_sysmem() const { return sysmem_size != 0; }
+
 private:
     TTDevice() = default;
 
@@ -233,6 +247,10 @@ private:
             close(sysfs_config_fd);
         }
 
+        if (sysmem != nullptr && sysmem != MAP_FAILED) {
+            munmap(sysmem, sysmem_size);
+        }
+
         drop();
     }
 
@@ -243,6 +261,8 @@ private:
         system_reg_mapping = nullptr;
         dma_buffer_mappings.clear();
         sysfs_config_fd = -1;
+        sysmem = nullptr;
+        sysmem_size = 0;
     }
 
     void do_open();
@@ -253,9 +273,41 @@ private:
 
 TTDevice TTDevice::open(unsigned int device_id) {
     TTDevice ttdev;
-    static int unique_id = 0;
     ttdev.index = device_id;
     ttdev.do_open();
+
+    if (ttdev.sysmem == MAP_FAILED) {
+        // The kernel driver indicated that it can manage the sysmem buffer, but we failed to mmap it.
+        // Attempt to set up driver-managed sysmem, and retry the do_open.
+        int fd = find_device(device_id);
+        int r = hugepage_setup_for_device(fd);
+        close(fd);
+
+        if (r == 0) {
+            // Setting up driver-managed sysmem succeeded, so re-try do_open.
+            // A retry is necessary because the driver will respond to the mapping query with a non-zero size now.
+            ttdev.reset();
+            ttdev.do_open();
+
+            if (ttdev.sysmem == MAP_FAILED || ttdev.sysmem == nullptr) {
+                // Unexpected failure case.  Fall back to the original mechanism (UMD control over sysmem 1G pages).
+                log_warning(
+                    LogSiliconDriver,
+                    "Failed to mmap sysmem buffer after setting up driver-managed sysmem.  Falling back to UMD control "
+                    "over 1G pages.");
+                ttdev.sysmem_size = 0;
+                ttdev.sysmem = nullptr;
+            }
+        } else {
+            // The setup failed, likely due to a boot-time misconfiguration.
+            // Fall back to the original mechanism.
+            log_warning(
+                LogSiliconDriver,
+                "Failed to set up driver-managed sysmem.  Falling back to UMD control over 1G pages.");
+            ttdev.sysmem_size = 0;
+            ttdev.sysmem = nullptr;
+        }
+    }
 
     return ttdev;
 }
@@ -436,15 +488,11 @@ void TTDevice::do_open() {
         throw std::runtime_error(std::string("Query mappings failed on device ") + std::to_string(index) + ".");
     }
 
-    tenstorrent_mapping bar0_uc_mapping;
-    tenstorrent_mapping bar0_wc_mapping;
-    tenstorrent_mapping bar2_uc_mapping;
-    tenstorrent_mapping bar2_wc_mapping;
-
-    memset(&bar0_uc_mapping, 0, sizeof(bar0_uc_mapping));
-    memset(&bar0_wc_mapping, 0, sizeof(bar0_wc_mapping));
-    memset(&bar2_uc_mapping, 0, sizeof(bar2_uc_mapping));
-    memset(&bar2_wc_mapping, 0, sizeof(bar2_wc_mapping));
+    tenstorrent_mapping bar0_uc_mapping{};
+    tenstorrent_mapping bar0_wc_mapping{};
+    tenstorrent_mapping bar2_uc_mapping{};
+    tenstorrent_mapping bar2_wc_mapping{};
+    tenstorrent_mapping tensix_dma_mapping{};
 
     for (unsigned int i = 0; i < mappings.query_mappings.in.output_mapping_count; i++) {
         if (mappings.mapping_array[i].mapping_id == TENSTORRENT_MAPPING_RESOURCE0_UC) {
@@ -461,6 +509,10 @@ void TTDevice::do_open() {
 
         if (mappings.mapping_array[i].mapping_id == TENSTORRENT_MAPPING_RESOURCE2_WC) {
             bar2_wc_mapping = mappings.mapping_array[i];
+        }
+
+        if (mappings.mapping_array[i].mapping_id == TENSTORRENT_MAPPING_RESOURCE_DMA) {
+            tensix_dma_mapping = mappings.mapping_array[i];
         }
     }
 
@@ -521,6 +573,19 @@ void TTDevice::do_open() {
 
     arch = detect_arch(this);
     architecture_implementation = tt::umd::architecture_implementation::create(static_cast<tt::umd::architecture>(arch));
+
+    if (tensix_dma_mapping.mapping_base != 0) {
+        // KMD has indicated that it supports the Tensix DMA buffer.
+        sysmem_size = tensix_dma_mapping.mapping_size;
+
+        if (sysmem_size == 0) {
+            // This will happen if the driver can manage sysmem but hasn't been set up to do so.
+            // set sysmem to MAP_FAILED to indicate to TTDevice::open() that setup + retry is needed.
+            sysmem = MAP_FAILED;
+        } else {
+            sysmem = mmap(NULL, sysmem_size, PROT_READ | PROT_WRITE, MAP_SHARED, device_fd, tensix_dma_mapping.mapping_base);
+        }
+    }
 }
 
 void set_debug_level(int dl) {
@@ -1410,9 +1475,24 @@ void tt_SiliconDevice::create_device(const std::unordered_set<chip_id_t> &target
         *pci_device = ttkmd_open ((DWORD) pci_interface_id, false);
         pci_device->logical_id = logical_device_id;
 
-        m_num_host_mem_channels = get_available_num_host_mem_channels(num_host_mem_ch_per_mmio_device, pci_device->device_id, pci_device->revision_id);
-        log_debug(LogSiliconDriver, "Using {} Hugepages/NumHostMemChannels for TTDevice (logical_device_id: {} pci_interface_id: {} device_id: 0x{:x} revision: {})",
-            m_num_host_mem_channels, logical_device_id, pci_interface_id, pci_device->device_id, pci_device->revision_id);
+        struct TTDevice* tt_device = pci_device->hdev;
+        if (!tt_device->kmd_supports_sysmem()) {
+            m_num_host_mem_channels = get_available_num_host_mem_channels(
+                num_host_mem_ch_per_mmio_device, pci_device->device_id, pci_device->revision_id);
+            log_debug(
+                LogSiliconDriver,
+                "Using {} Hugepages/NumHostMemChannels for TTDevice (logical_device_id: {} pci_interface_id: {} "
+                "device_id: 0x{:x} revision: {})",
+                m_num_host_mem_channels,
+                logical_device_id,
+                pci_interface_id,
+                pci_device->device_id,
+                pci_device->revision_id);
+        } else {
+            // If KMD manages sysmem, no need to look at hugepage quantity to determine the number of memory channels.
+            // Just divide sysmem size by 1GiB to get the equivalent value.
+            m_num_host_mem_channels = pci_device->hdev->sysmem_size / (1UL << 30);
+        }
 
         if (g_SINGLE_PIN_PAGE_PER_FD_WORKAROND) {
             pci_device->hdev->open_hugepage_per_host_mem_ch(m_num_host_mem_channels);
@@ -1845,12 +1925,24 @@ void tt_SiliconDevice::initialize_pcie_devices() {
         check_pcie_device_initialized(device_it.first);
     }
 
-    // If requires multi-channel or doesn't support mmio-p2p, init iatus without p2p.
-    if (m_num_host_mem_channels > 1 || arch_name != tt::ARCH::GRAYSKULL) {
-        init_pcie_iatus_no_p2p();
-    } else {
-        init_pcie_iatus();
+    // Assume if one device has KMD-managed sysmem, they all do.
+    bool sysmem_managed_by_kmd = false;
+    for (auto &device_it : m_pci_device_map){
+        auto *tt_device = device_it.second->hdev;
+        sysmem_managed_by_kmd |= tt_device->kmd_supports_sysmem();
     }
+
+    // If sysmem is managed by KMD, we don't need to initialize iATUs - they are already initialized by KMD.
+    if (!sysmem_managed_by_kmd) {
+
+        // If requires multi-channel or doesn't support mmio-p2p, init iatus without p2p.
+        if (m_num_host_mem_channels > 1 || arch_name != tt::ARCH::GRAYSKULL) {
+            init_pcie_iatus_no_p2p();
+        } else {
+            init_pcie_iatus();
+        }
+    }
+
     init_membars();
     
     // https://yyz-gitlab.local.tenstorrent.com/ihamer/ll-sw/issues/25
@@ -2222,16 +2314,17 @@ tt_SiliconDevice::~tt_SiliconDevice () {
     cleanup_shared_host_state();
 
     for (auto &device_it : m_pci_device_map){
-
         chip_id_t device_id = device_it.first;
+        struct PCIdevice* pci_device = device_it.second;
+        struct TTDevice* tt_device = pci_device->hdev;
 
-        for (int ch = 0; ch < m_num_host_mem_channels; ch ++) {
-            if (hugepage_mapping.at(device_id).at(ch)) {
-                munmap(hugepage_mapping.at(device_id).at(ch), hugepage_mapping_size.at(device_id).at(ch));
+        if (!tt_device->kmd_supports_sysmem()) {
+            for (int ch = 0; ch < m_num_host_mem_channels; ch ++) {
+                if (hugepage_mapping.at(device_id).at(ch)) {
+                    munmap(hugepage_mapping.at(device_id).at(ch), hugepage_mapping_size.at(device_id).at(ch));
+                }
             }
         }
-
-        struct PCIdevice* pci_device = device_it.second;
 
         ttkmd_close (*pci_device);
         delete pci_device;
@@ -2583,6 +2676,32 @@ bool tt_SiliconDevice::init_hugepage(chip_id_t device_id) {
 
     // Convert from logical (device_id in netlist) to physical device_id (in case of virtualization)
     auto physical_device_id = m_pci_device_map.at(device_id)->id;
+    auto logical_device_id = m_pci_device_map.at(device_id)->logical_id;
+    auto *tt_device = m_pci_device_map.at(device_id)->hdev;
+
+    if (tt_device->kmd_supports_sysmem()) {
+        size_t size = tt_device->sysmem_size;
+        log_info(LogSiliconDriver, "Using driver-managed sysmem buffer (size={} bytes)", size);
+
+        // Although the driver supports more than one gigabyte of virtually-contiguous sysmem, UMD design does not: UMD
+        // has the notion of channels.  For backwards compatibility, maintain the channel abstraction.
+        for (uint32_t ch = 0; ch < m_num_host_mem_channels; ch++) {
+            size_t channel_size = std::min(mapping_size, size);
+            uint8_t *sysmem_channel = reinterpret_cast<uint8_t*>(tt_device->sysmem) + (ch * channel_size);
+            
+            // These are keyed by "physical device_id", also spelled "src_device_id" elsewhere.
+            hugepage_mapping.at(device_id).at(ch) = sysmem_channel;
+            hugepage_mapping_size.at(device_id).at(ch) = channel_size;
+            hugepage_physical_address.at(device_id).at(ch) = 0;  // HACK: for the sake of the teardown code.
+
+            // This is keyed by "logical device id"
+            host_channel_size[logical_device_id].push_back(channel_size);
+            size -= channel_size;
+
+            log_info(LogSiliconDriver, "  channel {}: sysmem={:p} size={}", ch, sysmem_channel, channel_size);
+        }
+        return true;
+    }
 
     std::string hugepage_dir = find_hugepage_dir(hugepage_size);
     if (hugepage_dir.empty()) {

@@ -4,9 +4,9 @@ UMD_DEVICE_LIB = $(LIBDIR)/libdevice.so
 
 DEVICE_OBJDIR = $(OBJDIR)/umd
 DEVICE_SRCS = \
-	device/tt_device.cpp \
-	device/tt_silicon_driver.cpp \
-	device/tt_silicon_driver_common.cpp \
+  device/tt_device.cpp \
+  device/tt_silicon_driver.cpp \
+  device/tt_silicon_driver_common.cpp \
   device/tt_soc_descriptor.cpp \
   device/tt_cluster_descriptor.cpp \
   device/cpuset_lib.cpp \
@@ -15,6 +15,7 @@ DEVICE_SRCS = \
   device/grayskull_implementation.cpp \
   device/tlb.cpp \
   device/wormhole_implementation.cpp \
+  device/hugepages.cpp \
 
 DEVICE_INCLUDES=      	\
   -DFMT_HEADER_ONLY     \
@@ -61,7 +62,7 @@ else
 VERSIM_LIB = lib
 endif
 
-DEVICE_LDFLAGS = -lhwloc
+DEVICE_LDFLAGS = -lhwloc -lnuma
 
 ifneq ($(UMD_VERSIM_STUB),1)
 # Build Versim  based on configs specified in Buda or Metal build flow
